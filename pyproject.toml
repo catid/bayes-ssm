@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bayes-ssm"
+version = "0.1.0"
+description = "Dense Bayesian sequence layers and an associative CUDA scan"
+requires-python = ">=3.10"
+dependencies = ["torch>=2.4"]
+
+[tool.setuptools.packages.find]
+include = ["bayes_ssm*"]

@@ -1,0 +1,36 @@
+{
+  "device": "NVIDIA GB300",
+  "implementation": "FP32 CUDA associative information-form scan (PyTorch CUDA cumsum + batched Cholesky)",
+  "domain": "identity transition A=I, zero process noise Q=0",
+  "rows": [
+    {
+      "batch": 1,
+      "sequence": 16,
+      "key_dim": 4,
+      "value_dim": 4,
+      "dense_replay_reference_ms": 21.70899009797722,
+      "associative_scan_ms": 1.04054439580068,
+      "speedup": 20.863107989998397,
+      "max_abs_difference": 7.152557373046875e-07,
+      "relative_l2_difference": 3.3277230081097593e-07,
+      "cosine_similarity": 1.0000001192092896
+    },
+    {
+      "batch": 4,
+      "sequence": 64,
+      "key_dim": 16,
+      "value_dim": 16,
+      "dense_replay_reference_ms": 218.28236600849777,
+      "associative_scan_ms": 0.9975394001230596,
+      "speedup": 218.82079643327347,
+      "max_abs_difference": 6.735324859619141e-06,
+      "relative_l2_difference": 1.4615890400900684e-06,
+      "cosine_similarity": 1.0
+    }
+  ],
+  "notes": [
+    "Measurements include forward only and use synchronized CUDA timing.",
+    "The scan keeps the full dense covariance semantics; it is not a diagonal-covariance approximation.",
+    "General dynamics or nonzero process noise use ReplaySSM's dense replay path."
+  ]
+}

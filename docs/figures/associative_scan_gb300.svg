@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="460" viewBox="0 0 900 460" role="img" aria-labelledby="title desc">
+<title id="title">GB300 associative Bayesian scan throughput</title>
+<desc id="desc">Dense reference and associative CUDA scan milliseconds for two benchmark shapes.</desc>
+<rect width="900" height="460" fill="white"/>
+<text x="450" y="34" text-anchor="middle" font-family="sans-serif" font-size="22" font-weight="bold">GB300 Bayesian scan latency</text>
+<text x="450" y="58" text-anchor="middle" font-family="sans-serif" font-size="13" fill="#555">Lower is better · forward-only synchronized CUDA timing</text>
+<line x1="90" y1="380" x2="850" y2="380" stroke="#333"/>
+<line x1="90" y1="90" x2="90" y2="380" stroke="#333"/>
+<text x="22" y="235" transform="rotate(-90 22 235)" text-anchor="middle" font-family="sans-serif" font-size="14">milliseconds (log scale)</text>
+<text x="270" y="415" text-anchor="middle" font-family="sans-serif" font-size="14">B1 × T16 × D4 × M4</text>
+<text x="670" y="415" text-anchor="middle" font-family="sans-serif" font-size="14">B4 × T64 × D16 × M16</text>
+<!-- log-scale grid and labels: 0.5, 1, 2, 5, 10, 20, 50, 100, 200 -->
+<g font-family="sans-serif" font-size="11" fill="#666" stroke="#ddd">
+<line x1="90" y1="380" x2="850" y2="380"/><text x="82" y="384" text-anchor="end" stroke="none">0.5</text>
+<line x1="90" y1="344" x2="850" y2="344"/><text x="82" y="348" text-anchor="end" stroke="none">1</text>
+<line x1="90" y1="308" x2="850" y2="308"/><text x="82" y="312" text-anchor="end" stroke="none">2</text>
+<line x1="90" y1="260" x2="850" y2="260"/><text x="82" y="264" text-anchor="end" stroke="none">5</text>
+<line x1="90" y1="224" x2="850" y2="224"/><text x="82" y="228" text-anchor="end" stroke="none">10</text>
+<line x1="90" y1="188" x2="850" y2="188"/><text x="82" y="192" text-anchor="end" stroke="none">20</text>
+<line x1="90" y1="140" x2="850" y2="140"/><text x="82" y="144" text-anchor="end" stroke="none">50</text>
+<line x1="90" y1="104" x2="850" y2="104"/><text x="82" y="108" text-anchor="end" stroke="none">100</text>
+</g>
+<!-- bars -->
+<rect x="160" y="102" width="70" height="278" fill="#b8c2cc"/><rect x="270" y="344" width="70" height="36" fill="#1f77b4"/>
+<rect x="560" y="90" width="70" height="290" fill="#b8c2cc"/><rect x="670" y="344" width="70" height="36" fill="#1f77b4"/>
+<g font-family="sans-serif" font-size="13" text-anchor="middle"><text x="195" y="94">21.71</text><text x="305" y="336">1.04</text><text x="595" y="82">218.28</text><text x="705" y="336">1.00</text></g>
+<g font-family="sans-serif" font-size="13"><rect x="300" y="435" width="14" height="14" fill="#b8c2cc"/><text x="320" y="447">Dense reference</text><rect x="470" y="435" width="14" height="14" fill="#1f77b4"/><text x="490" y="447">Associative CUDA scan</text></g>
+</svg>
