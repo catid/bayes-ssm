@@ -27,13 +27,16 @@ import argparse
 import contextlib
 import json
 import math
+import os
 import sys
 import time
 from pathlib import Path
 from typing import Iterator
 
 import torch
+import torch.distributed as dist
 from torch import Tensor, nn
+from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.nn.functional as F
 
 # Make ``python example/train_6layer.py`` work directly from a source checkout
@@ -311,25 +314,100 @@ def _sample_batch(tokens: Tensor, *, batch: int, seq: int, generator: torch.Gene
     return tokens[starts[:, None] + offsets[None, :]]
 
 
+def _distributed_context(args: argparse.Namespace) -> tuple[torch.device, int, int, int, bool]:
+    """Initialize torchrun state and return (device, rank, world, local, enabled).
+
+    A regular single-process invocation keeps the device selected by
+    ``--device``.  Under torchrun, each process owns its local CUDA device and
+    NCCL/Gloo is initialized exactly once here so model construction and all
+    later collectives use the same process group.
+    """
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    if world_size < 1 or rank < 0 or rank >= world_size:
+        raise ValueError(
+            f"invalid torchrun environment: rank={rank}, world_size={world_size}"
+        )
+    enabled = world_size > 1
+    requested = torch.device(args.device)
+    if enabled:
+        if not dist.is_available():
+            raise RuntimeError("torch.distributed is unavailable but WORLD_SIZE > 1")
+        if requested.type == "cuda":
+            if not torch.cuda.is_available():
+                raise RuntimeError("torchrun requested CUDA but CUDA is unavailable")
+            if local_rank >= torch.cuda.device_count():
+                raise ValueError(
+                    f"LOCAL_RANK={local_rank} exceeds CUDA device count "
+                    f"({torch.cuda.device_count()})"
+                )
+            device = torch.device("cuda", local_rank)
+            torch.cuda.set_device(device)
+            backend = "nccl"
+        elif requested.type == "cpu":
+            device = torch.device("cpu")
+            backend = "gloo"
+        else:
+            raise ValueError(f"DDP supports CUDA or CPU, got {requested}")
+        if not dist.is_initialized():
+            dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
+    else:
+        device = requested
+        if device.type == "cuda":
+            torch.cuda.set_device(device)
+    return device, rank, world_size, local_rank, enabled
+
+
+def _barrier(enabled: bool) -> None:
+    if enabled:
+        dist.barrier()
+
+
+def _reduce_scalar(value: float, *, device: torch.device, op: dist.ReduceOp) -> float:
+    tensor = torch.tensor(value, device=device, dtype=torch.float64)
+    dist.all_reduce(tensor, op=op)
+    return float(tensor.item())
+
+
 def run(args: argparse.Namespace) -> dict[str, object]:
-    device = torch.device(args.device)
-    if device.type == "cuda":
-        torch.cuda.set_device(device)
+    device, rank, world_size, local_rank, ddp_enabled = _distributed_context(args)
+    if args.cuda_graph and ddp_enabled:
+        raise ValueError("--cuda-graph is not yet validated with multi-rank DDP")
     if args.cuda_graph and device.type != "cuda":
         raise ValueError("--cuda-graph requires a CUDA device")
+    # Every rank must initialize the model identically before DDP's parameter
+    # broadcast.  Preserve the regular single-process invocation's ambient
+    # RNG behavior; its data generator is already explicitly seeded below.
+    if ddp_enabled:
+        torch.manual_seed(args.seed)
+        if device.type == "cuda":
+            torch.cuda.manual_seed_all(args.seed)
     factory = LinearFactory(args.precision, device)
     optimized = bool(args.optimize_bayes and device.type == "cuda")
     model = SixLayerLM(
         args.vocab_size, args.width, args.heads, args.kv_heads, args.mlp_width,
         factory=factory, optimized=optimized, chunk_length=args.chunk_length,
     ).to(device)
+    if ddp_enabled:
+        model = DDP(
+            model,
+            device_ids=[local_rank] if device.type == "cuda" else None,
+            output_device=local_rank if device.type == "cuda" else None,
+            broadcast_buffers=False,
+            gradient_as_bucket_view=True,
+            bucket_cap_mb=args.ddp_bucket_cap_mb,
+            find_unused_parameters=False,
+        )
     train_tokens, valid_tokens = _make_data(args, seed=args.seed)
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=args.lr, betas=(0.9, 0.95),
         weight_decay=args.weight_decay, fused=device.type == "cuda",
         capturable=args.cuda_graph,
     )
-    generator = torch.Generator().manual_seed(args.seed + 1)
+    # Distinct streams avoid every rank doing identical synthetic windows while
+    # preserving reproducibility for a fixed rank/world-size configuration.
+    generator = torch.Generator().manual_seed(args.seed + 1 + rank)
     model.train()
 
     def train_step(inputs: Tensor, targets: Tensor) -> Tensor:
@@ -370,6 +448,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     if device.type == "cuda":
         torch.cuda.synchronize(device)
         torch.cuda.reset_peak_memory_stats(device)
+    _barrier(ddp_enabled)
     started = time.perf_counter()
     losses: list[float] = []
     if args.cuda_graph:
@@ -409,13 +488,28 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             losses.append(float(loss.detach()))
     if device.type == "cuda":
         torch.cuda.synchronize(device)
-    elapsed = time.perf_counter() - started
+    local_elapsed = time.perf_counter() - started
+    _barrier(ddp_enabled)
+    elapsed = (
+        _reduce_scalar(local_elapsed, device=device, op=dist.ReduceOp.MAX)
+        if ddp_enabled else local_elapsed
+    )
     model.eval()
     with torch.no_grad():
         batch = _sample_batch(valid_tokens, batch=args.batch, seq=args.seq, generator=generator).to(device)
         validation_loss = F.cross_entropy(
             model(batch[:, :-1], factory).reshape(-1, args.vocab_size), batch[:, 1:].reshape(-1)
         )
+    validation_value = float(validation_loss)
+    if ddp_enabled:
+        validation_value = _reduce_scalar(
+            validation_value, device=device, op=dist.ReduceOp.SUM
+        ) / world_size
+    final_train_loss = losses[-1] if losses else None
+    if ddp_enabled and final_train_loss is not None:
+        final_train_loss = _reduce_scalar(
+            final_train_loss, device=device, op=dist.ReduceOp.SUM
+        ) / world_size
     result: dict[str, object] = {
         "layers": list(SixLayerLM.block_kinds),
         "parameters": parameter_count(model),
@@ -433,14 +527,23 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         "bayesian_core": "exact dense covariance; compiled" if optimized else "exact dense covariance; eager",
         "chunk_length": args.chunk_length,
         "cuda_graph": bool(args.cuda_graph),
+        "rank": rank,
+        "local_rank": local_rank,
+        "world_size": world_size,
+        "ddp": ddp_enabled,
+        "ddp_bucket_cap_mb": args.ddp_bucket_cap_mb if ddp_enabled else None,
         "device": torch.cuda.get_device_name(device) if device.type == "cuda" else str(device),
         "elapsed_seconds": elapsed,
-        "tokens_per_second": args.steps * args.batch * args.seq / elapsed if elapsed else float("inf"),
+        "local_elapsed_seconds": local_elapsed,
+        "tokens_per_second": (
+            args.steps * args.batch * args.seq * world_size / elapsed
+            if elapsed else float("inf")
+        ),
         "peak_allocated_mib": torch.cuda.max_memory_allocated(device) / 2**20 if device.type == "cuda" else None,
         "peak_reserved_mib": torch.cuda.max_memory_reserved(device) / 2**20 if device.type == "cuda" else None,
-        "final_train_loss": losses[-1] if losses else None,
-        "validation_loss": float(validation_loss),
-        "validation_ppl": math.exp(float(validation_loss)) if float(validation_loss) < 20 else float("inf"),
+        "final_train_loss": final_train_loss,
+        "validation_loss": validation_value,
+        "validation_ppl": math.exp(validation_value) if validation_value < 20 else float("inf"),
     }
     return result
 
@@ -466,6 +569,8 @@ def main() -> None:
                         help="use the compiled exact Bayesian core on CUDA")
     parser.add_argument("--cuda-graph", action="store_true",
                         help="capture a fixed-shape forward/backward/AdamW step")
+    parser.add_argument("--ddp-bucket-cap-mb", type=float, default=25.0,
+                        help="DDP gradient bucket size in MiB (torchrun only)")
     parser.add_argument("--tokens", type=Path,
                         help="optional .npy or flat int64 token file; otherwise synthetic data is used")
     parser.add_argument("--valid-tokens", type=Path)
@@ -476,10 +581,18 @@ def main() -> None:
     if args.seq < 2 or args.batch <= 0 or args.steps < 0 or args.warmup < 0:
         parser.error("seq must be >=2; batch, steps, and warmup must be nonnegative/positive")
     result = run(args)
-    text = json.dumps(result, indent=2, sort_keys=True) + "\n"
-    print(text, end="")
-    if args.output is not None:
-        args.output.write_text(text, encoding="utf-8")
+    # Only rank zero emits a result file/record.  Other ranks still execute
+    # validation and reductions, then exit quietly after the process group is
+    # torn down so torchrun cannot observe interleaved JSON output.
+    rank = int(os.environ.get("RANK", "0"))
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    if rank == 0:
+        text = json.dumps(result, indent=2, sort_keys=True) + "\n"
+        print(text, end="")
+        if args.output is not None:
+            args.output.write_text(text, encoding="utf-8")
+    if world_size > 1 and dist.is_available() and dist.is_initialized():
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":
