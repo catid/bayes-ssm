@@ -29,7 +29,7 @@ the first shape incurs compilation. `--precision te-fp8` requires a
 CUDA-compatible TransformerEngine installation and fails explicitly when TE
 is unavailable. Every run prints JSON and can write it with `--output run.json`.
 
-The published GB300 throughput table in the top-level README comes from the
-longer benchmark harness and its recorded artifacts. The short default run
-is intended to validate the model and training path, not to estimate final
-hardware throughput.
+The top-level README records the final GB300 smoke-training result and links
+to its JSON artifact. The short default run is intended to validate the model
+and training path; use a real token file and longer training schedule for
+language-model experiments.

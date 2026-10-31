@@ -148,6 +148,10 @@ class BayesianMixer(nn.Module):
         self.v_proj = factory.linear(width, width)
         self.out_proj = factory.linear(width, width)
         self.read_norm = nn.RMSNorm(self.head_dim, dtype=factory.dtype)
+        # CroissAttn's gated readout keeps the recurrent contribution bounded
+        # before it is added to the residual stream.  The gate is projected
+        # from the same normalized input as Q/K/V and is applied per head.
+        self.g_proj = factory.linear(width, width)
         # A fixed, stable diagonal transition is the default production path;
         # covariance itself remains dense in bayesian_layer.
         self.register_buffer("decay", torch.full((1, 1, self.head_dim), 0.97), persistent=False)
@@ -179,7 +183,9 @@ class BayesianMixer(nn.Module):
         # state boundary so BF16 runs do not invoke a mixed-dtype fallback;
         # covariance and readout reductions above were FP32.
         read = self.read_norm(read.to(x.dtype))
-        return self.out_proj(read.reshape(b, t, self.width).to(x.dtype))
+        gate = self.g_proj(z).view(b, t, self.heads, self.head_dim)
+        read = (read * F.silu(gate)).reshape(b, t, self.width)
+        return self.out_proj(read.to(x.dtype))
 
 
 class SwiGLU(nn.Module):
