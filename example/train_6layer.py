@@ -548,7 +548,10 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         "steps": args.steps,
         "precision_requested": args.precision,
         "precision_active": factory.active,
-        "bayesian_core": "exact dense covariance; compiled" if optimized else "exact dense covariance; eager",
+        "bayesian_core": (
+            "exact dense covariance; fused CUDA chunk replay (with Inductor fallback)"
+            if optimized else "exact dense covariance; eager"
+        ),
         "chunk_length": args.chunk_length,
         "cuda_graph": bool(args.cuda_graph),
         "rank": rank,

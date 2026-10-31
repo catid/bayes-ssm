@@ -744,6 +744,49 @@ def bayesian_layer(
         # ``chunk_length=1`` when a token-by-token oracle is desired.
         chunk_length = t
     if optimized:
+        # The six-layer production configuration uses 64-dimensional heads
+        # with diagonal dynamics and scalar isotropic process noise.  Dispatch
+        # that exact case to the optional persistent CUDA kernel before the
+        # general Inductor path.  The extension keeps only chunk-boundary
+        # states and recomputes each chunk in reverse, so it is safe for
+        # training and CUDA graph capture while retaining the full covariance.
+        # Other dimensions, dense transitions, learnable noise, and CPU runs
+        # continue through the reference implementation below.
+        if (
+            device.type == "cuda"
+            and len(batch_shape) == 1
+            and d == 64
+            and m == 64
+            and diagonal_transition is not None
+            and process_covariances is None
+            and not process_variances.requires_grad
+            and not observation_variances.requires_grad
+            and not mean.requires_grad
+            and not covariance.requires_grad
+        ):
+            try:
+                from .fused_cuda import fused_diagonal_bayesian
+
+                fused = fused_diagonal_bayesian(
+                    keys, values, queries, diagonal_transition,
+                    process_variances, observation_variances, mean, covariance,
+                    chunk_length=chunk_length,
+                    denominator_floor=float(denominator_floor),
+                )
+            except RuntimeError as exc:
+                # A compiler/toolkit mismatch should leave the validated
+                # Inductor path available rather than making the public API
+                # unusable.  The optional loader caches the failure, so later
+                # calls do not repeatedly attempt a broken build.
+                if os.environ.get("BAYES_SSM_VERBOSE_BUILD", "0") == "1":
+                    warnings.warn(
+                        f"fused Bayesian CUDA core unavailable; using Inductor: {exc}",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
+                fused = None
+            if fused is not None:
+                return fused
         # Keep the recurrent state autograd metadata stable across chunks.  The
         # first chunk starts from constant initial state, while later chunks
         # receive state tensors whose values depend on the input.  Inductor

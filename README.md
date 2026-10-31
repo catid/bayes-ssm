@@ -26,19 +26,19 @@ These are CUDA forward timings, not end-to-end optimizer-step measurements. The 
 The [`example/`](example/) directory contains a runnable causal language-model recipe with the production layer arrangement used in the training comparison: Bayesian mixers in blocks 1, 2, 4, and 5, causal GQA attention in blocks 3 and 6, SwiGLU feed-forwards, tied embeddings, and the CroissAttn FP32 recurrent-state boundary. The default dimensions are approximately 100M parameters (640-wide, 10 query heads, 2 KV heads, 6,144-wide MLP, 32k vocabulary). It supports synthetic data for a smoke run and `.npy` or flat token files for a real corpus.
 
 ```bash
-python example/train_6layer.py --device cuda:0 --precision te-fp8 \
+python example/train_6layer.py --device cuda:0 --precision bf16 \
   --optimize-bayes --cuda-graph --tokens train.npy --valid-tokens valid.npy \
   --seq 512 --batch 128 --steps 100 --warmup 5 --output run.json
 ```
 
-The recorded GB300 training result below includes forward, backward, and fused AdamW updates. It uses fixed-shape CUDA graph capture for a 100-step synthetic training run; the validation loss is a health metric rather than a language-quality measurement. The complete Bayesian record is [`example/results/gb300_6layer_final.json`](example/results/gb300_6layer_final.json), with the matched Mamba-3 baseline in [`example/results/gb300_6layer_mamba3_baseline.json`](example/results/gb300_6layer_mamba3_baseline.json).
+The recorded GB300 training result below includes forward, backward, and fused AdamW updates. It uses fixed-shape CUDA graph capture for a 100-step synthetic training run; the validation loss is a health metric rather than a language-quality measurement. The Bayesian recurrence is exact dense covariance; the fixed 64-dimensional diagonal-dynamics case uses the fused CUDA chunk-replay core. The complete Bayesian record is [`example/results/gb300_6layer_final.json`](example/results/gb300_6layer_final.json), with the matched Mamba-3 baseline in [`example/results/gb300_6layer_mamba3_baseline.json`](example/results/gb300_6layer_mamba3_baseline.json).
 
 | Model | Parameters | Precision | Batch × sequence | Throughput | Peak VRAM | Validation CE / PPL* | Step scope |
 |---|---:|---|---:|---:|---:|---:|---|
-| Bayesian/GQA six-layer | 101.43M | TE FP8 projections + FP32 state | 128 × 512 per GPU | **175,875 tok/s** | 182,364 MiB | 10.501 / 36,353 | forward + backward + fused AdamW |
+| Bayesian/GQA six-layer | 101.43M | BF16 projections + fused exact CUDA recurrence + FP32 state | 128 × 512 per GPU | **322,325 tok/s** | 62,967 MiB | 10.394 / 32,671 | forward + backward + fused AdamW |
 | Matched Mamba-3 SISO six-layer | 107.38M | BF16 | 128 × 512 per GPU | **495,529 tok/s** | 64,921 MiB | — | forward + backward + fused AdamW |
 
-The Bayesian mixer uses the exact fixed-diagonal-decay dense-covariance recurrence. Its compiled diagonal-transition specialization removes diagonal-matrix materialization while retaining the full covariance matrix; CUDA graph capture removes repeated launch and allocator overhead for the fixed shape. The associative scan numbers above are a separate forward-only identity-transition, zero-process-noise kernel benchmark.
+The Bayesian mixer uses the exact fixed-diagonal-decay dense-covariance recurrence. The fused CUDA path checkpoints chunk boundaries and recomputes each chunk during the reverse pass, retaining FP32 covariance state while avoiding token-level covariance histories. The associative scan numbers above are a separate forward-only identity-transition, zero-process-noise kernel benchmark.
 
 \* The validation stream in this recorded run is synthetic and random; CE/PPL are included as health metrics, not accuracy claims.
 

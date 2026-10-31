@@ -11,3 +11,6 @@ dependencies = ["torch>=2.4"]
 
 [tool.setuptools.packages.find]
 include = ["bayes_ssm*"]
+
+[tool.setuptools.package-data]
+bayes_ssm = ["*.cu"]
