@@ -27,6 +27,7 @@ import argparse
 import contextlib
 import json
 import math
+import sys
 import time
 from pathlib import Path
 from typing import Iterator
@@ -35,6 +36,9 @@ import torch
 from torch import Tensor, nn
 import torch.nn.functional as F
 
+# Make ``python example/train_6layer.py`` work directly from a source checkout
+# without requiring an editable install first.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from bayes_ssm.bayesian_layer import bayesian_layer
 
 
