@@ -97,7 +97,7 @@ class GQAAttention(nn.Module):
     def __init__(self, width: int, heads: int, kv_heads: int, factory: LinearFactory):
         super().__init__()
         if width % heads or heads % kv_heads:
-            raise ValueError("width must be divisible by heads; heads must divide kv_heads")
+            raise ValueError("width must be divisible by heads; kv_heads must divide heads")
         self.width = width
         self.heads = heads
         self.kv_heads = kv_heads
