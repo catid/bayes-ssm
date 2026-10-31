@@ -355,7 +355,14 @@ def _distributed_context(args: argparse.Namespace) -> tuple[torch.device, int, i
     else:
         device = requested
         if device.type == "cuda":
-            torch.cuda.set_device(device)
+            # ``torch.device("cuda")`` has no explicit index and is accepted
+            # by tensor factories, but ``set_device`` requires one.  Preserve
+            # the caller's current device for single-process runs and make it
+            # explicit for the rest of the training path.
+            if device.index is None:
+                device = torch.device("cuda", torch.cuda.current_device())
+            else:
+                torch.cuda.set_device(device)
     return device, rank, world_size, local_rank, enabled
 
 
