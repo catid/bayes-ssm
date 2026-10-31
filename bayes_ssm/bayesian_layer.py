@@ -291,11 +291,12 @@ def _compiled_outputs_need_clone() -> bool:
     chunk boundary.  Keep a conservative ``True`` fallback for older/private
     configurations where the setting cannot be inspected.
     """
-    try:
-        import torch._inductor.config as inductor_config
-        return bool(inductor_config.triton.cudagraphs)
-    except (AttributeError, ImportError, RuntimeError):
-        return True
+    # ``torch.compile(mode=...)`` installs CUDA-graph settings as per-call
+    # config patches; the global ``torch._inductor.config.triton.cudagraphs``
+    # flag therefore remains false even in ``reduce-overhead`` mode.  Decide
+    # from the mode that owns the compiled callable instead of inspecting the
+    # unpatched global configuration.
+    return _compiled_core_mode() != "default"
 
 
 def _checkpointed_backward_enabled() -> bool:
@@ -372,6 +373,10 @@ def _run_compiled_core(*args):
             return tuple(value.clone() for value in output)
         return output
     except _COMPILE_FALLBACK_EXCEPTIONS as exc:
+        if _is_cuda_graph_capturing(args[0]) and _compiled_core_mode() != "default":
+            raise RuntimeError(
+                "Bayesian compiled core fell back while a CUDA graph was being captured"
+            ) from exc
         # Some CUDA/Inductor versions cannot compile every dtype or operator
         # used by a caller.  Keep the numerical reference fallback, but make
         # it visible: silently switching to the Python recurrence makes an
@@ -410,6 +415,10 @@ def _run_compiled_diagonal_transition(*args):
             return tuple(value.clone() for value in output)
         return output
     except _COMPILE_FALLBACK_EXCEPTIONS as exc:
+        if _is_cuda_graph_capturing(args[0]) and _compiled_core_mode() != "default":
+            raise RuntimeError(
+                "Bayesian diagonal core fell back while a CUDA graph was being captured"
+            ) from exc
         if key not in _COMPILED_FALLBACK_WARNED:
             _COMPILED_FALLBACK_WARNED.add(key)
             warnings.warn(
