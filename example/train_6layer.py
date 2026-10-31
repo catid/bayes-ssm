@@ -388,8 +388,6 @@ def _reduce_scalar(value: float, *, device: torch.device, op: dist.ReduceOp) -> 
 
 def run(args: argparse.Namespace) -> dict[str, object]:
     device, rank, world_size, local_rank, ddp_enabled = _distributed_context(args)
-    if args.cuda_graph and ddp_enabled:
-        raise ValueError("--cuda-graph is not yet validated with multi-rank DDP")
     if args.cuda_graph and device.type != "cuda":
         raise ValueError("--cuda-graph requires a CUDA device")
     # Every rank must initialize the model identically before DDP's parameter
@@ -414,7 +412,24 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             gradient_as_bucket_view=True,
             bucket_cap_mb=args.ddp_bucket_cap_mb,
             find_unused_parameters=False,
+            static_graph=bool(args.cuda_graph),
         )
+        if args.cuda_graph:
+            # DDP's C++ logger records a CUDA event in every pre-forward call;
+            # event synchronization is illegal during graph capture.  Keep a
+            # delegating proxy so reducer internals remain intact while the
+            # capture-only runtime-stat call becomes a no-op.
+            class _CaptureLoggerProxy:
+                def __init__(self, logger):
+                    self._logger = logger
+
+                def set_runtime_stats_and_log(self):
+                    return None
+
+                def __getattr__(self, name):
+                    return getattr(self._logger, name)
+
+            model.logger = _CaptureLoggerProxy(model.logger)
     train_tokens, valid_tokens = _make_data(args, seed=args.seed)
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=args.lr, betas=(0.9, 0.95),
@@ -461,6 +476,12 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             batch = batch.to(device)
             loss = train_step(batch[:, :-1], batch[:, 1:])
         del loss
+    if ddp_enabled and args.cuda_graph and device.type == "cuda":
+        # The first DDP forward may rebuild gradient buckets.  Do that while
+        # the stream is not capturing so the capture sees fixed CUDA buckets;
+        # otherwise the reducer attempts a CPU-to-CUDA copy inside capture.
+        model.reducer._rebuild_buckets()
+        torch.cuda.synchronize(device)
     if device.type == "cuda":
         torch.cuda.synchronize(device)
         torch.cuda.reset_peak_memory_stats(device)
