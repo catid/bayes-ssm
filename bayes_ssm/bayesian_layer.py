@@ -189,6 +189,53 @@ def _core_loop(
     return torch.stack(outputs, dim=-2), mean, covariance
 
 
+def _core_loop_diagonal_transition(
+    keys: Tensor,
+    values: Tensor,
+    queries: Tensor,
+    transition_diagonals: Tensor,
+    process_variances: Tensor,
+    observation_variances: Tensor,
+    mean: Tensor,
+    covariance: Tensor,
+    denominator_floor: float,
+) -> Tuple[Tensor, Tensor, Tensor]:
+    """Exact dense-covariance core for diagonal transition matrices.
+
+    This is only a dynamics specialization: ``covariance`` remains a full
+    dense matrix and every rank-one update is retained.  Scaling rows and
+    columns elementwise avoids the two D³ matrix products caused by
+    materializing ``diag_embed(A)``.  It therefore preserves the Bayesian
+    model while removing the largest cost in the six-layer GDN-style block.
+    """
+    outputs = []
+    for i in range(keys.shape[-2]):
+        diagonal = transition_diagonals[..., i, :]
+        predicted_mean = diagonal[..., :, None] * mean
+        predicted_covariance = diagonal[..., :, None] * covariance * diagonal[..., None, :]
+        predicted_covariance = torch.diagonal_scatter(
+            predicted_covariance,
+            torch.diagonal(predicted_covariance, dim1=-2, dim2=-1)
+            + process_variances[..., i, None],
+            dim1=-2,
+            dim2=-1,
+        )
+        key = keys[..., i, :]
+        uncertainty_key = torch.matmul(predicted_covariance, key.unsqueeze(-1)).squeeze(-1)
+        innovation_variance = observation_variances[..., i] + torch.sum(
+            key * uncertainty_key, dim=-1
+        )
+        beta = innovation_variance.clamp_min(denominator_floor).reciprocal()
+        innovation = values[..., i, :] - torch.matmul(
+            predicted_mean.transpose(-1, -2), key.unsqueeze(-1)
+        ).squeeze(-1)
+        mean = predicted_mean + beta[..., None, None] * uncertainty_key[..., :, None] * innovation[..., None, :]
+        covariance = predicted_covariance - beta[..., None, None] * uncertainty_key[..., :, None] * uncertainty_key[..., None, :]
+        covariance = (covariance + covariance.transpose(-1, -2)) * 0.5
+        outputs.append(torch.matmul(mean.transpose(-1, -2), queries[..., i, :].unsqueeze(-1)).squeeze(-1))
+    return torch.stack(outputs, dim=-2), mean, covariance
+
+
 _COMPILED_CORES: dict[tuple[object, ...], object] = {}
 _MAX_COMPILED_CORES = 32
 _COMPILED_FALLBACK_WARNED: set[tuple[object, ...]] = set()
@@ -324,6 +371,39 @@ def _run_compiled_core(*args):
                 stacklevel=2,
             )
         return _core_loop(*args)
+
+
+def _run_compiled_diagonal_transition(*args):
+    """Compile/cache the exact dense-covariance diagonal-A specialization."""
+    mode = _compiled_core_mode()
+    key = ("diagonal-transition", "mode", mode) + _compiled_core_key(args)
+    compiled_core = _COMPILED_CORES.get(key)
+    if compiled_core is None:
+        compiled_core = torch.compile(
+            _core_loop_diagonal_transition, fullgraph=False, dynamic=False, mode=mode
+        )
+        _COMPILED_CORES[key] = compiled_core
+        if len(_COMPILED_CORES) > _MAX_COMPILED_CORES:
+            _COMPILED_CORES.pop(next(iter(_COMPILED_CORES)))
+    try:
+        needs_clone = _compiled_outputs_need_clone()
+        mark_step_begin = getattr(torch.compiler, "cudagraph_mark_step_begin", None)
+        if mark_step_begin is not None and args[0].is_cuda and needs_clone:
+            mark_step_begin()
+        output = compiled_core(*args)
+        if needs_clone:
+            return tuple(value.clone() for value in output)
+        return output
+    except _COMPILE_FALLBACK_EXCEPTIONS as exc:
+        if key not in _COMPILED_FALLBACK_WARNED:
+            _COMPILED_FALLBACK_WARNED.add(key)
+            warnings.warn(
+                "BayesianLayer exact diagonal-transition core fell back to eager execution "
+                f"for shape key {key!r}: {type(exc).__name__}: {exc}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        return _core_loop_diagonal_transition(*args)
 
 
 class _CheckpointedCoreFunction(torch.autograd.Function):
@@ -535,10 +615,10 @@ def bayesian_layer(
         raise ValueError("pass transitions or transition_diagonals, not both")
     if not isinstance(replay_ssm, bool):
         raise TypeError("replay_ssm must be a bool")
-    # ``transition_diagonals`` is retained as a compact input convenience, but
-    # it is converted to the same dense recurrence as every other transition.
-    # There is deliberately no diagonal-covariance approximation or separate
-    # diagonal kernel: rank-one Bayesian updates create off-diagonal covariance.
+    # ``transition_diagonals`` is a compact exact-dynamics representation. The
+    # specialized core below still carries a full dense covariance; it only
+    # avoids materializing diagonal A and its redundant matrix products.
+    diagonal_transition = None
     if transition_diagonals is not None:
         if not isinstance(transition_diagonals, Tensor) or transition_diagonals.ndim < 2:
             raise ValueError(f"transition_diagonals must have shape [..., T={t}, D={d}]")
@@ -550,7 +630,8 @@ def bayesian_layer(
         if not _broadcastable(transition_diagonals.shape[:-2], batch_shape):
             raise ValueError("transition_diagonals batch dimensions are not broadcastable to the input batch")
         _check_finite(transition_diagonals, "transition_diagonals")
-        transitions = torch.diag_embed(transition_diagonals)
+        diagonal_transition = transition_diagonals
+        transitions = None
     elif transitions is None:
         eye = torch.eye(d, device=device, dtype=dtype)
         transitions = eye.expand(*batch_shape, t, d, d)
@@ -585,8 +666,11 @@ def bayesian_layer(
             process_variances, t, batch_shape, "process_variances", device=device, dtype=dtype
         )
         _validate_variance(process_variances, "process_variances", strictly_positive=False)
-        eye = torch.eye(d, device=device, dtype=dtype)
-        process_covariances = process_variances[..., None, None] * eye
+        if optimized and diagonal_transition is not None:
+            process_covariances = None
+        else:
+            eye = torch.eye(d, device=device, dtype=dtype)
+            process_covariances = process_variances[..., None, None] * eye
     if observation_variances is None:
         observation_variances = 1.0
     observation_variances = _as_time_tensor(
@@ -628,6 +712,18 @@ def bayesian_layer(
         raise ValueError("chunk_length must be a positive integer or None")
     if t == 0:
         return torch.empty(*batch_shape, 0, m, device=device, dtype=dtype), mean, covariance
+    # The replay autograd boundary saves its dense transition/process inputs.
+    # Materialize the exact representation in that opt-in mode so gradients
+    # through diagonal dynamics and process noise are not dropped.
+    if diagonal_transition is not None and (
+        not optimized
+        or (torch.is_grad_enabled() and (replay_ssm or _checkpointed_backward_enabled()))
+    ):
+        transitions = torch.diag_embed(diagonal_transition)
+        if process_covariances is None:
+            eye = torch.eye(d, device=device, dtype=dtype)
+            process_covariances = process_variances[..., None, None] * eye
+        diagonal_transition = None
     if chunk_length is None:
         # A missing chunk length means one full sequence chunk. Use explicit
         # ``chunk_length=1`` when a token-by-token oracle is desired.
@@ -671,19 +767,39 @@ def bayesian_layer(
             # the same graph on the first chunk of every sequence.
             mean = mean.contiguous()
             covariance = covariance.contiguous()
-            chunk_args = (
-                keys[..., start:stop, :], values[..., start:stop, :],
-                queries[..., start:stop, :], transitions[..., start:stop, :, :],
-                process_covariances[..., start:stop, :, :],
-                observation_variances[..., start:stop], mean, covariance,
-                float(denominator_floor),
-            )
-            if checkpointed:
-                output, mean, covariance = _CheckpointedCoreFunction.apply(*chunk_args)
+            if diagonal_transition is not None and process_covariances is None and not checkpointed:
+                output, mean, covariance = _run_compiled_diagonal_transition(
+                    keys[..., start:stop, :], values[..., start:stop, :],
+                    queries[..., start:stop, :], diagonal_transition[..., start:stop, :],
+                    process_variances[..., start:stop],
+                    observation_variances[..., start:stop], mean, covariance,
+                    float(denominator_floor),
+                )
             else:
-                output, mean, covariance = _run_compiled_core(*chunk_args)
+                if diagonal_transition is not None and process_covariances is None:
+                    eye = torch.eye(d, device=device, dtype=dtype)
+                    dense_transitions = torch.diag_embed(diagonal_transition[..., start:stop, :])
+                    dense_process = process_variances[..., start:stop, None, None] * eye
+                else:
+                    dense_transitions = transitions[..., start:stop, :, :]
+                    dense_process = process_covariances[..., start:stop, :, :]
+                chunk_args = (
+                    keys[..., start:stop, :], values[..., start:stop, :],
+                    queries[..., start:stop, :], dense_transitions, dense_process,
+                    observation_variances[..., start:stop], mean, covariance,
+                    float(denominator_floor),
+                )
+                if checkpointed:
+                    output, mean, covariance = _CheckpointedCoreFunction.apply(*chunk_args)
+                else:
+                    output, mean, covariance = _run_compiled_core(*chunk_args)
             outputs.append(output)
         return torch.cat(outputs, dim=-2), mean, covariance
+    if diagonal_transition is not None:
+        transitions = torch.diag_embed(diagonal_transition)
+        if process_covariances is None:
+            eye = torch.eye(d, device=device, dtype=dtype)
+            process_covariances = process_variances[..., None, None] * eye
     return _run_chunked(keys, values, queries, transitions, process_covariances,
                         observation_variances, mean, covariance,
                         chunk_length=chunk_length, denominator_floor=denominator_floor)
