@@ -37,7 +37,7 @@ The recorded GB300 training result below includes forward, backward, and fused A
 |---|---:|---|---:|---:|---:|---:|---|
 | Bayesian/GQA six-layer | 101.43M | BF16 + FP32 state | 1 × 512 | **691.9 tok/s** | 2,235 MiB | 10.498 / 36,252 | forward + backward + fused AdamW |
 
-The Bayesian mixer uses the exact learned-decay dense-covariance recurrence. Its compiled diagonal-transition specialization removes diagonal-matrix materialization while retaining the full covariance matrix. The associative scan numbers above are a separate forward-only identity-transition, zero-process-noise kernel benchmark.
+The Bayesian mixer uses the exact fixed-diagonal-decay dense-covariance recurrence. Its compiled diagonal-transition specialization removes diagonal-matrix materialization while retaining the full covariance matrix. The associative scan numbers above are a separate forward-only identity-transition, zero-process-noise kernel benchmark.
 
 \* The validation stream in this recorded run is synthetic and random; CE/PPL are included as health metrics, not accuracy claims.
 
