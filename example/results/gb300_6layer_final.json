@@ -1,5 +1,5 @@
 {
-  "schema": "bayes-ssm-six-layer-gb300-v2",
+  "schema": "bayes-ssm-six-layer-gb300-v3",
   "device": "NVIDIA GB300",
   "model": {
     "layers": ["bayesian", "bayesian", "fa-gqa", "bayesian", "bayesian", "fa-gqa"],
@@ -10,7 +10,8 @@
     "mlp_width": 6144,
     "vocab_size": 32000,
     "sequence_length": 512,
-    "batch": 8
+    "batch": 128,
+    "batch_scope": "per GPU"
   },
   "precision": "TransformerEngine FP8 projections with FP32 Bayesian state",
   "optimizer": "capturable fused AdamW",
@@ -20,11 +21,11 @@
   "timed_steps": 100,
   "warmup_steps": 5,
   "dataset": "synthetic random token stream (seed 123)",
-  "tokens_per_second": 43366.23711622856,
-  "elapsed_seconds": 9.445135830028448,
-  "peak_allocated_mib": 12389.4638671875,
-  "final_train_loss": 8.963225364685059,
-  "validation_loss": 10.507111549377441,
-  "validation_perplexity": 36574.68265799114,
+  "tokens_per_second": 175875.31329748294,
+  "elapsed_seconds": 37.26276233501267,
+  "peak_allocated_mib": 182364.3857421875,
+  "final_train_loss": 10.030984878540039,
+  "validation_loss": 10.501026153564453,
+  "validation_perplexity": 36352.78708325364,
   "measurement": "full forward, backward, and optimizer step"
 }

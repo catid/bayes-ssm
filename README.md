@@ -28,14 +28,14 @@ The [`example/`](example/) directory contains a runnable causal language-model r
 ```bash
 python example/train_6layer.py --device cuda:0 --precision te-fp8 \
   --optimize-bayes --cuda-graph --tokens train.npy --valid-tokens valid.npy \
-  --seq 512 --batch 8 --steps 100 --warmup 5 --output run.json
+  --seq 512 --batch 128 --steps 100 --warmup 5 --output run.json
 ```
 
 The recorded GB300 training result below includes forward, backward, and fused AdamW updates. It uses fixed-shape CUDA graph capture for a 100-step synthetic training run; the validation loss is a health metric rather than a language-quality measurement. The complete record is [`example/results/gb300_6layer_final.json`](example/results/gb300_6layer_final.json).
 
 | Model | Parameters | Precision | Batch × sequence | Throughput | Peak VRAM | Validation CE / PPL* | Step scope |
 |---|---:|---|---:|---:|---:|---:|---|
-| Bayesian/GQA six-layer | 101.43M | TE FP8 projections + FP32 state | 8 × 512 | **43,366 tok/s** | 12,389 MiB | 10.507 / 36,575 | forward + backward + fused AdamW |
+| Bayesian/GQA six-layer | 101.43M | TE FP8 projections + FP32 state | 128 × 512 per GPU | **175,875 tok/s** | 182,364 MiB | 10.501 / 36,353 | forward + backward + fused AdamW |
 
 The Bayesian mixer uses the exact fixed-diagonal-decay dense-covariance recurrence. Its compiled diagonal-transition specialization removes diagonal-matrix materialization while retaining the full covariance matrix; CUDA graph capture removes repeated launch and allocator overhead for the fixed shape. The associative scan numbers above are a separate forward-only identity-transition, zero-process-noise kernel benchmark.
 

@@ -167,14 +167,23 @@ class BayesianMixer(nn.Module):
     def forward(self, x: Tensor) -> Tensor:
         b, t, _ = x.shape
         z = self.norm(x)
-        # Normalize each head before entering the FP32 state boundary.  This
-        # prevents a single projection outlier from dominating the covariance.
-        q = F.normalize(F.silu(self.q_proj(z).float()), dim=-1)
-        k = F.normalize(F.silu(self.k_proj(z).float()), dim=-1)
-        v = F.silu(self.v_proj(z).float())
-        q = q.view(b, t, self.heads, self.head_dim).permute(0, 2, 1, 3)
-        k = k.view(b, t, self.heads, self.head_dim).permute(0, 2, 1, 3)
-        v = v.view(b, t, self.heads, self.head_dim).permute(0, 2, 1, 3)
+        # Normalize each head before entering the FP32 state boundary.  The
+        # normalization must happen after splitting the projection into heads:
+        # normalizing the flattened width would shrink every head's key norm
+        # by roughly sqrt(num_heads), weakening the Kalman update by that
+        # factor while leaving observation variance unchanged.
+        q = F.silu(self.q_proj(z).float()).view(
+            b, t, self.heads, self.head_dim
+        )
+        k = F.silu(self.k_proj(z).float()).view(
+            b, t, self.heads, self.head_dim
+        )
+        v = F.silu(self.v_proj(z).float()).view(
+            b, t, self.heads, self.head_dim
+        )
+        q = F.normalize(q, dim=-1).permute(0, 2, 1, 3)
+        k = F.normalize(k, dim=-1).permute(0, 2, 1, 3)
+        v = v.permute(0, 2, 1, 3)
         shape = (b * self.heads, t, self.head_dim)
         q, k, v = (value.reshape(shape) for value in (q, k, v))
         decay = self.decay.expand(b * self.heads, t, self.head_dim)
@@ -458,6 +467,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     _barrier(ddp_enabled)
     started = time.perf_counter()
     losses: list[float] = []
+    graph_loss_tensor: Tensor | None = None
     if args.cuda_graph:
         assert static_inputs is not None and static_targets is not None
         # The override keeps autograd nodes created during warmup on the
@@ -484,8 +494,13 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             static_inputs.copy_(batch[:, :-1])
             static_targets.copy_(batch[:, 1:])
             graph.replay()
-            torch.cuda.synchronize(device)
-            losses.append(float(graph_loss.detach()))
+        # Replays only enqueue work.  Synchronizing and converting the scalar
+        # loss to a Python float inside this loop would force a device/host
+        # round trip for every step and largely defeat CUDA graph launch
+        # amortization.  The final device synchronization below makes the
+        # latest captured loss value safe to read once for reporting.
+        if args.steps:
+            graph_loss_tensor = graph_loss
     else:
         for _ in range(args.steps):
             batch = _sample_batch(
@@ -495,6 +510,8 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             losses.append(float(loss.detach()))
     if device.type == "cuda":
         torch.cuda.synchronize(device)
+    if graph_loss_tensor is not None:
+        losses.append(float(graph_loss_tensor.detach()))
     local_elapsed = time.perf_counter() - started
     _barrier(ddp_enabled)
     elapsed = (
