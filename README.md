@@ -35,7 +35,7 @@ The recorded GB300 training result below includes forward, backward, and fused A
 
 | Model | Parameters | Precision | Batch × sequence | Throughput | Peak VRAM | Validation CE / PPL* | Step scope |
 |---|---:|---|---:|---:|---:|---:|---|
-| Bayesian/GQA six-layer | 101.43M | BF16 projections + fused exact CUDA recurrence + FP32 state | 128 × 512 per GPU | **322,325 tok/s** | 62,967 MiB | 10.394 / 32,671 | forward + backward + fused AdamW |
+| Bayesian/GQA six-layer | 101.43M | BF16 projections + fused exact CUDA recurrence + FP32 state | 128 × 512 per GPU | **325,275 tok/s** | 62,967 MiB | 10.394 / 32,654 | forward + backward + fused AdamW |
 | Matched Mamba-3 SISO six-layer | 107.38M | BF16 | 128 × 512 per GPU | **495,529 tok/s** | 64,921 MiB | — | forward + backward + fused AdamW |
 
 The Bayesian mixer uses the exact fixed-diagonal-decay dense-covariance recurrence. The fused CUDA path checkpoints chunk boundaries and recomputes each chunk during the reverse pass, retaining FP32 covariance state while avoiding token-level covariance histories. The associative scan numbers above are a separate forward-only identity-transition, zero-process-noise kernel benchmark.

@@ -86,6 +86,15 @@ class _ChunkedBayesianFunction(torch.autograd.Function):
         )
         ctx.chunk_length = int(chunk_length)
         ctx.denominator_floor = float(denominator_floor)
+        # The production Bayesian mixer uses fixed decay/process/observation
+        # buffers and discards the recurrent final states.  Keep this bit of
+        # metadata so the reverse kernel can omit the unused dynamics-gradient
+        # epilogue while retaining the full path for callers that learn decay.
+        ctx.need_dynamics_grad = any(
+            value.requires_grad for value in (
+                decay, process, observation, initial_mean, initial_covariance,
+            )
+        )
         ctx.output_shape = tuple(output.shape)
         ctx.mean_shape = tuple(final_mean.shape)
         ctx.covariance_shape = tuple(final_covariance.shape)
@@ -101,19 +110,42 @@ class _ChunkedBayesianFunction(torch.autograd.Function):
             initial_mean, initial_covariance, boundary_mean, boundary_covariance,
         ) = ctx.saved_tensors
         device = keys.device
+        # In the production mixer only the token readout is consumed.  The
+        # recurrent final mean/covariance are returned for the public API but
+        # have no downstream users, so autograd supplies ``None`` for them.
+        # Let the extension omit all unused dynamics/state-gradient buffers
+        # in this common fixed-parameter case.
+        lean_backward = (
+            not ctx.need_dynamics_grad
+            and grad_mean is None
+            and grad_covariance is None
+        )
         grad_output = (
             torch.zeros(ctx.output_shape, device=device, dtype=keys.dtype)
             if grad_output is None else grad_output.contiguous()
         )
-        grad_mean = (
-            torch.zeros(ctx.mean_shape, device=device, dtype=keys.dtype)
-            if grad_mean is None else grad_mean.contiguous()
+        if not lean_backward:
+            grad_mean = (
+                torch.zeros(ctx.mean_shape, device=device, dtype=keys.dtype)
+                if grad_mean is None else grad_mean.contiguous()
+            )
+            grad_covariance = (
+                torch.zeros(ctx.covariance_shape, device=device, dtype=keys.dtype)
+                if grad_covariance is None else grad_covariance.contiguous()
+            )
+        backward = (
+            extension.backward_chunked
+            if not lean_backward
+            else getattr(extension, "backward_chunked_lean", extension.backward_chunked)
         )
-        grad_covariance = (
-            torch.zeros(ctx.covariance_shape, device=device, dtype=keys.dtype)
-            if grad_covariance is None else grad_covariance.contiguous()
-        )
-        gradients = extension.backward_chunked(
+        if lean_backward:
+            gradients = backward(
+                keys, values, queries, decay, process, observation,
+                initial_mean, initial_covariance, boundary_mean, boundary_covariance,
+                grad_output, ctx.chunk_length, ctx.denominator_floor,
+            )
+            return (*gradients, None, None, None, None, None, None, None)
+        gradients = backward(
             keys, values, queries, decay, process, observation,
             initial_mean, initial_covariance, boundary_mean, boundary_covariance,
             grad_output, grad_mean, grad_covariance, ctx.chunk_length,
