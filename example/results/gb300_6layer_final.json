@@ -1,0 +1,30 @@
+{
+  "schema": "bayes-ssm-six-layer-gb300-v2",
+  "device": "NVIDIA GB300",
+  "model": {
+    "layers": ["bayesian", "bayesian", "fa-gqa", "bayesian", "bayesian", "fa-gqa"],
+    "parameters": 101425536,
+    "width": 640,
+    "heads": 10,
+    "kv_heads": 2,
+    "mlp_width": 6144,
+    "vocab_size": 32000,
+    "sequence_length": 512,
+    "batch": 8
+  },
+  "precision": "TransformerEngine FP8 projections with FP32 Bayesian state",
+  "optimizer": "capturable fused AdamW",
+  "bayesian_core": "exact dense covariance; compiled diagonal-transition specialization",
+  "cuda_graph": true,
+  "chunk_length": 64,
+  "timed_steps": 100,
+  "warmup_steps": 5,
+  "dataset": "synthetic random token stream (seed 123)",
+  "tokens_per_second": 43366.23711622856,
+  "elapsed_seconds": 9.445135830028448,
+  "peak_allocated_mib": 12389.4638671875,
+  "final_train_loss": 8.963225364685059,
+  "validation_loss": 10.507111549377441,
+  "validation_perplexity": 36574.68265799114,
+  "measurement": "full forward, backward, and optimizer step"
+}

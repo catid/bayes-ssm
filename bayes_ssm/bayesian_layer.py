@@ -92,10 +92,25 @@ def _as_time_tensor(
     return x
 
 
+def _is_cuda_graph_capturing(x: Tensor) -> bool:
+    """Return whether host-side validation must be skipped for ``x``."""
+    if not x.is_cuda:
+        return False
+    try:
+        return bool(torch.cuda.is_current_stream_capturing())
+    except RuntimeError:
+        return False
+
+
 def _check_finite(x: Tensor, name: str) -> None:
     # Data-dependent Python checks are intentionally skipped under full-graph
     # compilation; the fused graph will propagate any non-finite values.
     if torch.compiler.is_compiling():
+        return
+    # Host-visible validation is illegal during CUDA graph capture. Inputs
+    # have already been validated during warmup; the captured FP32 recurrence
+    # propagates any non-finite value to the graph output.
+    if _is_cuda_graph_capturing(x):
         return
     if x.numel() and not bool(torch.isfinite(x).all()):
         raise ValueError(f"{name} must contain only finite values")
@@ -103,7 +118,7 @@ def _check_finite(x: Tensor, name: str) -> None:
 
 def _validate_variance(x: Tensor, name: str, *, strictly_positive: bool) -> None:
     _check_finite(x, name)
-    if torch.compiler.is_compiling():
+    if torch.compiler.is_compiling() or _is_cuda_graph_capturing(x):
         return
     if x.numel() == 0:
         return
@@ -118,7 +133,7 @@ def _validate_covariance(x: Tensor, name: str, d: int) -> None:
     if x.shape[-2:] != (d, d):
         raise ValueError(f"{name} must end in {(d, d)}, got {tuple(x.shape)}")
     _check_finite(x, name)
-    if torch.compiler.is_compiling():
+    if torch.compiler.is_compiling() or _is_cuda_graph_capturing(x):
         return
     if not x.numel():
         return

@@ -30,6 +30,7 @@ CUDA-compatible TransformerEngine installation and fails explicitly when TE
 is unavailable. Every run prints JSON and can write it with `--output run.json`.
 
 The top-level README records the final GB300 smoke-training result and links
-to its JSON artifact. The short default run is intended to validate the model
-and training path; use a real token file and longer training schedule for
-language-model experiments.
+to its JSON artifact. The graph path requires fixed batch and sequence shapes;
+use the default launch path when shapes change between steps. The short
+default run is intended to validate the model and training path; use a real
+token file and longer training schedule for language-model experiments.

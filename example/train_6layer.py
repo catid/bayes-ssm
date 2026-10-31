@@ -155,6 +155,11 @@ class BayesianMixer(nn.Module):
         # A fixed, stable diagonal transition is the default production path;
         # covariance itself remains dense in bayesian_layer.
         self.register_buffer("decay", torch.full((1, 1, self.head_dim), 0.97), persistent=False)
+        # Keep scalar noise on the module device.  Besides avoiding a tiny
+        # host-to-device conversion every token block, this makes the complete
+        # fixed-shape training step capturable by torch.cuda.CUDAGraph.
+        self.register_buffer("process_variance", torch.tensor(0.1), persistent=False)
+        self.register_buffer("observation_variance", torch.tensor(1.0), persistent=False)
 
     def forward(self, x: Tensor) -> Tensor:
         b, t, _ = x.shape
@@ -173,8 +178,8 @@ class BayesianMixer(nn.Module):
         read, _, _ = bayesian_layer(
             k, v, q,
             transition_diagonals=decay,
-            process_variances=0.1,
-            observation_variances=1.0,
+            process_variances=self.process_variance,
+            observation_variances=self.observation_variance,
             chunk_length=self.chunk_length,
             optimized=self.optimized,
         )
@@ -218,7 +223,7 @@ class HybridBlock(nn.Module):
         self.kind = kind
         if kind == "bayesian":
             self.mixer = BayesianMixer(
-                width, heads, factory, optimized=optimized, chunk_length=chunk_length
+                width, heads, factory, optimized=optimized, chunk_length=chunk_length,
             )
         elif kind == "fa":
             self.mixer = GQAAttention(width, heads, kv_heads, factory)
@@ -310,6 +315,8 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     device = torch.device(args.device)
     if device.type == "cuda":
         torch.cuda.set_device(device)
+    if args.cuda_graph and device.type != "cuda":
+        raise ValueError("--cuda-graph requires a CUDA device")
     factory = LinearFactory(args.precision, device)
     optimized = bool(args.optimize_bayes and device.type == "cuda")
     model = SixLayerLM(
@@ -317,32 +324,89 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         factory=factory, optimized=optimized, chunk_length=args.chunk_length,
     ).to(device)
     train_tokens, valid_tokens = _make_data(args, seed=args.seed)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.95),
-                                  weight_decay=args.weight_decay,
-                                  fused=device.type == "cuda")
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=args.lr, betas=(0.9, 0.95),
+        weight_decay=args.weight_decay, fused=device.type == "cuda",
+        capturable=args.cuda_graph,
+    )
     generator = torch.Generator().manual_seed(args.seed + 1)
     model.train()
-    for _ in range(args.warmup):
-        batch = _sample_batch(train_tokens, batch=args.batch, seq=args.seq, generator=generator).to(device)
-        loss = F.cross_entropy(model(batch[:, :-1], factory).reshape(-1, args.vocab_size), batch[:, 1:].reshape(-1))
-        optimizer.zero_grad(set_to_none=True)
+
+    def train_step(inputs: Tensor, targets: Tensor) -> Tensor:
+        # CUDA graph capture requires stable gradient storage.  ``set_to_none``
+        # is therefore false for both warmup and capture.
+        optimizer.zero_grad(set_to_none=False)
+        logits = model(inputs, factory)
+        loss = F.cross_entropy(
+            logits.reshape(-1, args.vocab_size), targets.reshape(-1)
+        )
         loss.backward()
+        if args.grad_clip > 0:
+            nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
         optimizer.step()
+        return loss
+
+    static_inputs: Tensor | None = None
+    static_targets: Tensor | None = None
+    if args.cuda_graph:
+        static_inputs = torch.empty(
+            (args.batch, args.seq), device=device, dtype=torch.long
+        )
+        static_targets = torch.empty_like(static_inputs)
+
+    for _ in range(args.warmup):
+        batch = _sample_batch(
+            train_tokens, batch=args.batch, seq=args.seq, generator=generator
+        )
+        if args.cuda_graph:
+            assert static_inputs is not None and static_targets is not None
+            static_inputs.copy_(batch[:, :-1])
+            static_targets.copy_(batch[:, 1:])
+            loss = train_step(static_inputs, static_targets)
+        else:
+            batch = batch.to(device)
+            loss = train_step(batch[:, :-1], batch[:, 1:])
+        del loss
     if device.type == "cuda":
         torch.cuda.synchronize(device)
         torch.cuda.reset_peak_memory_stats(device)
     started = time.perf_counter()
     losses: list[float] = []
-    for _ in range(args.steps):
-        batch = _sample_batch(train_tokens, batch=args.batch, seq=args.seq, generator=generator).to(device)
-        logits = model(batch[:, :-1], factory)
-        loss = F.cross_entropy(logits.reshape(-1, args.vocab_size), batch[:, 1:].reshape(-1))
-        optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        if args.grad_clip > 0:
-            nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-        optimizer.step()
-        losses.append(float(loss.detach()))
+    if args.cuda_graph:
+        assert static_inputs is not None and static_targets is not None
+        # The override keeps autograd nodes created during warmup on the
+        # capture stream.  Without it, PyTorch rejects AccumulateGrad nodes
+        # that still reference the default stream.
+        set_capture_stream = getattr(
+            torch.autograd.graph, "set_override_stale_capture_stream", None
+        )
+        if set_capture_stream is not None:
+            set_capture_stream(True)
+        graph = torch.cuda.CUDAGraph()
+        try:
+            with torch.cuda.graph(graph):
+                graph_loss = train_step(static_inputs, static_targets)
+        except Exception as exc:
+            raise RuntimeError(
+                "CUDA graph capture failed; use the default launch path or "
+                "a fixed-shape capturable optimizer"
+            ) from exc
+        for _ in range(args.steps):
+            batch = _sample_batch(
+                train_tokens, batch=args.batch, seq=args.seq, generator=generator
+            )
+            static_inputs.copy_(batch[:, :-1])
+            static_targets.copy_(batch[:, 1:])
+            graph.replay()
+            torch.cuda.synchronize(device)
+            losses.append(float(graph_loss.detach()))
+    else:
+        for _ in range(args.steps):
+            batch = _sample_batch(
+                train_tokens, batch=args.batch, seq=args.seq, generator=generator
+            ).to(device)
+            loss = train_step(batch[:, :-1], batch[:, 1:])
+            losses.append(float(loss.detach()))
     if device.type == "cuda":
         torch.cuda.synchronize(device)
     elapsed = time.perf_counter() - started
@@ -368,6 +432,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         "precision_active": factory.active,
         "bayesian_core": "exact dense covariance; compiled" if optimized else "exact dense covariance; eager",
         "chunk_length": args.chunk_length,
+        "cuda_graph": bool(args.cuda_graph),
         "device": torch.cuda.get_device_name(device) if device.type == "cuda" else str(device),
         "elapsed_seconds": elapsed,
         "tokens_per_second": args.steps * args.batch * args.seq / elapsed if elapsed else float("inf"),
@@ -399,6 +464,8 @@ def main() -> None:
     parser.add_argument("--chunk-length", type=int, default=64)
     parser.add_argument("--optimize-bayes", action="store_true",
                         help="use the compiled exact Bayesian core on CUDA")
+    parser.add_argument("--cuda-graph", action="store_true",
+                        help="capture a fixed-shape forward/backward/AdamW step")
     parser.add_argument("--tokens", type=Path,
                         help="optional .npy or flat int64 token file; otherwise synthetic data is used")
     parser.add_argument("--valid-tokens", type=Path)
