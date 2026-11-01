@@ -194,6 +194,7 @@ class BayesianMixer(nn.Module):
             observation_variances=self.observation_variance,
             chunk_length=self.chunk_length,
             optimized=self.optimized,
+            fixed_dynamics=True,
         )
         read = read.view(b, self.heads, t, self.head_dim).permute(0, 2, 1, 3)
         # RMSNorm's parameter dtype follows the projection path. Cast at the
@@ -439,6 +440,20 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     # Distinct streams avoid every rank doing identical synthetic windows while
     # preserving reproducibility for a fixed rank/world-size configuration.
     generator = torch.Generator().manual_seed(args.seed + 1 + rank)
+    # Synthetic benchmark runs do not need a host-side token sampler.  Keeping
+    # the fixed-shape input pool on the GPU removes the CPU indexing and H2D
+    # copy from the CUDA-graph replay loop.  Real token streams continue to use
+    # the ordinary host sampler, since their corpus must remain authoritative.
+    gpu_batches: Tensor | None = None
+    if args.cuda_graph and args.gpu_batch_staging and args.tokens is None:
+        gpu_generator = torch.Generator(device=device).manual_seed(args.seed + 1 + rank)
+        gpu_batches = torch.randint(
+            args.vocab_size,
+            (args.steps, args.batch, args.seq + 1),
+            generator=gpu_generator,
+            device=device,
+            dtype=torch.long,
+        )
     model.train()
 
     def train_step(inputs: Tensor, targets: Tensor) -> Tensor:
@@ -508,12 +523,17 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                 "CUDA graph capture failed; use the default launch path or "
                 "a fixed-shape capturable optimizer"
             ) from exc
-        for _ in range(args.steps):
-            batch = _sample_batch(
-                train_tokens, batch=args.batch, seq=args.seq, generator=generator
-            )
-            static_inputs.copy_(batch[:, :-1])
-            static_targets.copy_(batch[:, 1:])
+        for step_index in range(args.steps):
+            if gpu_batches is None:
+                batch = _sample_batch(
+                    train_tokens, batch=args.batch, seq=args.seq, generator=generator
+                )
+                static_inputs.copy_(batch[:, :-1])
+                static_targets.copy_(batch[:, 1:])
+            else:
+                batch = gpu_batches[step_index]
+                static_inputs.copy_(batch[:, :-1])
+                static_targets.copy_(batch[:, 1:])
             graph.replay()
         # Replays only enqueue work.  Synchronizing and converting the scalar
         # loss to a Python float inside this loop would force a device/host
@@ -570,11 +590,13 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         "precision_requested": args.precision,
         "precision_active": factory.active,
         "bayesian_core": (
-            "exact dense covariance; fused CUDA chunk replay (with Inductor fallback)"
-            if optimized else "exact dense covariance; eager"
+            "exact dense covariance; fused CUDA chunk replay"
+            if optimized and os.environ.get("BAYES_SSM_DISABLE_FUSED_CUDA", "0") != "1"
+            else ("exact dense covariance; Inductor fallback" if optimized else "exact dense covariance; eager")
         ),
         "chunk_length": args.chunk_length,
         "cuda_graph": bool(args.cuda_graph),
+        "gpu_batch_staging": bool(gpu_batches is not None),
         "rank": rank,
         "local_rank": local_rank,
         "world_size": world_size,
@@ -617,6 +639,8 @@ def main() -> None:
                         help="use the compiled exact Bayesian core on CUDA")
     parser.add_argument("--cuda-graph", action="store_true",
                         help="capture a fixed-shape forward/backward/AdamW step")
+    parser.add_argument("--gpu-batch-staging", action="store_true",
+                        help="pre-stage synthetic CUDA-graph batches on GPU (benchmark mode)")
     parser.add_argument("--ddp-bucket-cap-mb", type=float, default=25.0,
                         help="DDP gradient bucket size in MiB (torchrun only)")
     parser.add_argument("--tokens", type=Path,

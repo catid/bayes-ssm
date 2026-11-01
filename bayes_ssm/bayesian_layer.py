@@ -565,6 +565,7 @@ def bayesian_layer(
     chunk_length: Optional[int] = None,
     optimized: bool = False,
     replay_ssm: bool = False,
+    fixed_dynamics: bool = False,
 ) -> Tuple[Tensor, Tensor, Tensor]:
     """Run an exact Bayesian Layer over a sequence.
 
@@ -594,6 +595,10 @@ def bayesian_layer(
             the full covariance equations. The environment variable
             ``MEMORY_BY_DESIGN_CHECKPOINTED_BACKWARD=1`` enables the same
             boundary globally.
+        fixed_dynamics: use the compile-time ``A=0.97I, Q=0.1I, R=1`` CUDA
+            specialization when the fused path is selected. This is an exact
+            specialization for those constants and is ignored by fallback
+            implementations.
 
     Inputs with float16, bfloat16, or any available float8 dtype are promoted
     to float32 for the recurrent state and readouts.  This is intentional: the
@@ -639,6 +644,8 @@ def bayesian_layer(
         raise ValueError("pass transitions or transition_diagonals, not both")
     if not isinstance(replay_ssm, bool):
         raise TypeError("replay_ssm must be a bool")
+    if not isinstance(fixed_dynamics, bool):
+        raise TypeError("fixed_dynamics must be a bool")
     # ``transition_diagonals`` is a compact exact-dynamics representation. The
     # specialized core below still carries a full dense covariance; it only
     # avoids materializing diagonal A and its redundant matrix products.
@@ -781,6 +788,7 @@ def bayesian_layer(
                     process_variances, observation_variances, mean, covariance,
                     chunk_length=chunk_length,
                     denominator_floor=float(denominator_floor),
+                    fixed_dynamics=fixed_dynamics,
                 )
             except RuntimeError as exc:
                 # A compiler/toolkit mismatch should leave the validated

@@ -33,7 +33,7 @@ def _load_extension():
 
         source = Path(__file__).with_name("persistent_bayes_chunked.cu")
         _EXTENSION = load(
-            name="bayes_ssm_persistent_chunked",
+            name="bayes_ssm_persistent_chunked_fixed",
             sources=[str(source)],
             extra_cuda_cflags=["-O3"],
             with_cuda=True,
@@ -61,12 +61,17 @@ class _ChunkedBayesianFunction(torch.autograd.Function):
         initial_covariance: Tensor,
         chunk_length: int,
         denominator_floor: float,
+        fixed_dynamics: bool,
     ):
         extension = _load_extension()
         if extension is None:
             raise RuntimeError("the fused Bayesian CUDA extension is unavailable")
         n, t, _ = keys.shape
-        result = extension.forward_chunked(
+        forward_impl = (
+            extension.forward_chunked_fixed
+            if fixed_dynamics else extension.forward_chunked
+        )
+        result = forward_impl(
             keys, values, queries, decay, process, observation,
             initial_mean, initial_covariance, int(chunk_length),
             float(denominator_floor),
@@ -86,6 +91,7 @@ class _ChunkedBayesianFunction(torch.autograd.Function):
         )
         ctx.chunk_length = int(chunk_length)
         ctx.denominator_floor = float(denominator_floor)
+        ctx.fixed_dynamics = bool(fixed_dynamics)
         # The production Bayesian mixer uses fixed decay/process/observation
         # buffers and discards the recurrent final states.  Keep this bit of
         # metadata so the reverse kernel can omit the unused dynamics-gradient
@@ -133,25 +139,28 @@ class _ChunkedBayesianFunction(torch.autograd.Function):
                 torch.zeros(ctx.covariance_shape, device=device, dtype=keys.dtype)
                 if grad_covariance is None else grad_covariance.contiguous()
             )
-        backward = (
-            extension.backward_chunked
-            if not lean_backward
-            else getattr(extension, "backward_chunked_lean", extension.backward_chunked)
-        )
+        if lean_backward and ctx.fixed_dynamics:
+            backward = extension.backward_chunked_lean_fixed
+        else:
+            backward = (extension.backward_chunked
+                        if not lean_backward
+                        else getattr(extension, "backward_chunked_lean", extension.backward_chunked))
         if lean_backward:
             gradients = backward(
                 keys, values, queries, decay, process, observation,
                 initial_mean, initial_covariance, boundary_mean, boundary_covariance,
                 grad_output, ctx.chunk_length, ctx.denominator_floor,
             )
-            return (*gradients, None, None, None, None, None, None, None)
+            # 3 tensor gradients + 8 non-differentiable inputs.
+            return (*gradients, None, None, None, None, None, None, None, None)
         gradients = backward(
             keys, values, queries, decay, process, observation,
             initial_mean, initial_covariance, boundary_mean, boundary_covariance,
             grad_output, grad_mean, grad_covariance, ctx.chunk_length,
             ctx.denominator_floor,
         )
-        return (*gradients, None, None)
+        # 8 tensor gradients + 3 non-differentiable inputs.
+        return (*gradients, None, None, None)
 
 
 def fused_diagonal_bayesian(
@@ -166,6 +175,7 @@ def fused_diagonal_bayesian(
     *,
     chunk_length: int,
     denominator_floor: float,
+    fixed_dynamics: bool = False,
 ) -> tuple[Tensor, Tensor, Tensor] | None:
     """Run the exact CUDA core when its fixed-shape contract is satisfied.
 
@@ -217,7 +227,7 @@ def fused_diagonal_bayesian(
     return _ChunkedBayesianFunction.apply(
         keys, values, queries, decay, process, observation,
         initial_mean, initial_covariance,
-        int(chunk_length), float(denominator_floor),
+        int(chunk_length), float(denominator_floor), bool(fixed_dynamics),
     )
 
 

@@ -1,0 +1,42 @@
+{
+  "schema": "bayes-ssm-six-layer-gb300-backward-comparison-v1",
+  "device": "NVIDIA GB300",
+  "container": "depth-memory-exp:26.07b",
+  "model": {
+    "layers": ["bayesian", "bayesian", "fa-gqa", "bayesian", "bayesian", "fa-gqa"],
+    "parameters": 101425536,
+    "width": 640,
+    "heads": 10,
+    "kv_heads": 2,
+    "mlp_width": 6144,
+    "vocab_size": 32000,
+    "sequence_length": 512,
+    "batch": 128
+  },
+  "precision": "BF16 projections with FP32 Bayesian state",
+  "optimizer": "capturable fused AdamW",
+  "cuda_graph": true,
+  "gpu_batch_staging": true,
+  "chunk_length": 64,
+  "timed_steps": 30,
+  "warmup_steps": 5,
+  "measurement": "full forward, backward, and optimizer step",
+  "runs": [
+    {
+      "name": "fused_cuda_fixed_dynamics",
+      "bayesian_core": "exact dense covariance; fused CUDA chunk replay",
+      "tokens_per_second": 96600.11073130678,
+      "elapsed_seconds": 20.352771700941958,
+      "peak_allocated_mib": 62983.125,
+      "peak_reserved_mib": 87012.0
+    },
+    {
+      "name": "inductor_baseline",
+      "bayesian_core": "exact dense covariance; Inductor fallback",
+      "tokens_per_second": 156528.41154215424,
+      "elapsed_seconds": 12.560531220049597,
+      "peak_allocated_mib": 184259.1875,
+      "peak_reserved_mib": 209574.0
+    }
+  ]
+}

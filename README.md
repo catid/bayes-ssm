@@ -31,16 +31,20 @@ python example/train_6layer.py --device cuda:0 --precision bf16 \
   --seq 512 --batch 128 --steps 100 --warmup 5 --output run.json
 ```
 
-The recorded GB300 training result below includes forward, backward, and fused AdamW updates. It uses fixed-shape CUDA graph capture for a 100-step synthetic training run; the validation loss is a health metric rather than a language-quality measurement. The Bayesian recurrence is exact dense covariance; the fixed 64-dimensional diagonal-dynamics case uses the fused CUDA chunk-replay core. The complete Bayesian record is [`example/results/gb300_6layer_final.json`](example/results/gb300_6layer_final.json), with the matched Mamba-3 baseline in [`example/results/gb300_6layer_mamba3_baseline.json`](example/results/gb300_6layer_mamba3_baseline.json).
+The recorded GB300 result below includes forward, backward, and fused AdamW updates. It uses fixed-shape CUDA graph capture, the exact dense-covariance CUDA chunk-replay core, and two-rank NCCL DDP. Synthetic benchmark input staging is enabled only for the synthetic run; corpus-backed runs use the normal token loader. The Bayesian record is [example/results/gb300_6layer_final.json](example/results/gb300_6layer_final.json), the paired single-GPU comparison is [example/results/gb300_6layer_backward_comparison.json](example/results/gb300_6layer_backward_comparison.json), and the matched Mamba-3 baseline is in [example/results/gb300_6layer_mamba3_baseline.json](example/results/gb300_6layer_mamba3_baseline.json).
 
-| Model | Parameters | Precision | Batch × sequence | Throughput | Peak VRAM | Validation CE / PPL* | Step scope |
-|---|---:|---|---:|---:|---:|---:|---|
-| Bayesian/GQA six-layer | 101.43M | BF16 projections + fused exact CUDA recurrence + FP32 state | 128 × 512 per GPU | **325,275 tok/s** | 62,967 MiB | 10.394 / 32,654 | forward + backward + fused AdamW |
-| Matched Mamba-3 SISO six-layer | 107.38M | BF16 | 128 × 512 per GPU | **495,529 tok/s** | 64,921 MiB | — | forward + backward + fused AdamW |
+| Model | Parameters | Precision | Batch × sequence | Throughput | Peak VRAM | Step scope |
+|---|---:|---|---:|---:|---:|---|
+| Bayesian/GQA six-layer, 2-rank DDP | 101.43M | BF16 projections + FP32 Bayesian state | 128 × 512 per GPU | **189,075 tok/s global** | **62,976 MiB/rank** | forward + backward + fused AdamW |
+| Bayesian/GQA six-layer, single GB300 | 101.43M | BF16 projections + FP32 Bayesian state | 128 × 512 | 96,600 tok/s | 62,983 MiB | forward + backward + fused AdamW |
+| Bayesian/GQA six-layer, Inductor baseline | 101.43M | BF16 projections + FP32 Bayesian state | 128 × 512 | 156,528 tok/s | 184,259 MiB | forward + backward + fused AdamW |
+| Matched Mamba-3 SISO six-layer | 107.38M | BF16 | 128 × 512 per GPU | 495,529 tok/s | 64,921 MiB | forward + backward + fused AdamW |
 
-The Bayesian mixer uses the exact fixed-diagonal-decay dense-covariance recurrence. The fused CUDA path checkpoints chunk boundaries and recomputes each chunk during the reverse pass, retaining FP32 covariance state while avoiding token-level covariance histories. The associative scan numbers above are a separate forward-only identity-transition, zero-process-noise kernel benchmark.
+The single-GPU Bayesian and Inductor rows are a paired 30-step run in the same GB300 container after the active-stream and fixed-dynamics fixes. The fused path is 1.62× slower in this shape, while using 65.9% less allocated VRAM.
 
-\* The validation stream in this recorded run is synthetic and random; CE/PPL are included as health metrics, not accuracy claims.
+The CUDA extension launches on the active PyTorch stream, so CUDA graph replay executes the Bayesian forward and reverse kernels on every step. The recurrent state and covariance remain FP32; the chunk-replay backward retains exact dense-covariance math while storing only chunk boundaries and recomputation intermediates.
+
+The validation stream is synthetic random data, so its loss is a health check rather than a language-quality claim.
 
 ## Install
 
