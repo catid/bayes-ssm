@@ -31,14 +31,14 @@ python example/train_6layer.py --device cuda:0 --precision bf16 \
   --seq 512 --batch 128 --steps 100 --warmup 5 --output run.json
 ```
 
-The recorded GB300 result below includes forward, backward, and fused AdamW updates. It uses fixed-shape CUDA graph capture, the exact dense-covariance CUDA chunk-replay core, and two-rank NCCL DDP. Synthetic benchmark input staging is enabled only for the synthetic run; corpus-backed runs use the normal token loader. The final Bayesian record is [example/results/gb300_6layer_final.json](example/results/gb300_6layer_final.json), and the matched Mamba-3 baseline is in [example/results/gb300_6layer_mamba3_baseline.json](example/results/gb300_6layer_mamba3_baseline.json).
+The recorded GB300 result below includes forward, backward, and fused AdamW updates. It uses fixed-shape CUDA graph capture, the exact dense-covariance recurrence compiled with Inductor, and two-rank NCCL DDP. Synthetic benchmark input staging is enabled only for the synthetic run; corpus-backed runs use the normal token loader. The final Bayesian record is [example/results/gb300_6layer_final.json](example/results/gb300_6layer_final.json), and the matched Mamba-3 baseline is in [example/results/gb300_6layer_mamba3_baseline.json](example/results/gb300_6layer_mamba3_baseline.json).
 
 | Model | Parameters | Precision | Batch × sequence | Throughput | Peak VRAM | Step scope |
 |---|---:|---|---:|---:|---:|---|
 | Bayesian/GQA six-layer, 2-rank DDP | 101.43M | BF16 projections + FP32 Bayesian state + Inductor recurrence | 128 × 512 per GPU | **312,733 tok/s global** | **184,264 MiB/rank** | forward + backward + fused AdamW |
 | Matched Mamba-3 SISO six-layer | 107.38M | BF16 | 128 × 512 per GPU | 495,529 tok/s | 64,921 MiB | forward + backward + fused AdamW |
 
-The CUDA extension launches on the active PyTorch stream, so CUDA graph replay executes the Bayesian forward and reverse kernels on every step. The recurrent state and covariance remain FP32; the chunk-replay backward retains exact dense-covariance math while storing only chunk boundaries and recomputation intermediates.
+The recurrent state and covariance remain FP32. The selectable fused CUDA backend launches on the active PyTorch stream, so CUDA graph replay executes its Bayesian forward and reverse kernels on every step; it retains exact dense-covariance math while storing only chunk boundaries and recomputation intermediates.
 
 Use `--bayes-backend fused` when the lower-memory custom CUDA replay path is preferred; `inductor` is the fastest measured backend for the recorded shape.
 
