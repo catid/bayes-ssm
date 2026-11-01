@@ -23,7 +23,7 @@ These are CUDA forward timings, not end-to-end optimizer-step measurements. The 
 
 ## Six-layer training example
 
-The [`example/`](example/) directory contains a runnable causal language-model recipe with the production layer arrangement used in the training comparison: Bayesian mixers in blocks 1, 2, 4, and 5, causal GQA attention in blocks 3 and 6, SwiGLU feed-forwards, tied embeddings, and the CroissAttn FP32 recurrent-state boundary. The default dimensions are approximately 100M parameters (640-wide, 10 query heads, 2 KV heads, 6,144-wide MLP, 32k vocabulary). It supports synthetic data for a smoke run and `.npy` or flat token files for a real corpus.
+The [`example/`](example/) directory contains a runnable causal language-model recipe with the production layer arrangement used in the training comparison: Bayesian mixers in blocks 1, 2, 4, and 5, causal GQA attention in blocks 3 and 6, SwiGLU feed-forwards, tied embeddings, and the CroissAttn FP32 recurrent-state boundary. The default dimensions are approximately 100M parameters (640-wide, 20 query heads, 4 KV heads, 6,144-wide MLP, 32k vocabulary). It supports synthetic data for a smoke run and `.npy` or flat token files for a real corpus.
 
 ```bash
 python example/train_6layer.py --device cuda:0 --precision bf16 \
@@ -35,7 +35,7 @@ The recorded GB300 result below includes forward, backward, and fused AdamW upda
 
 | Model | Parameters | Precision | Batch × sequence | Throughput | Peak VRAM | Step scope |
 |---|---:|---|---:|---:|---:|---|
-| Bayesian/GQA six-layer, 2-rank DDP | 101.43M | BF16 projections + FP32 Bayesian state + fixed scalar Inductor recurrence | 128 × 512 per GPU | **454,587 tok/s global** | **75,384 MiB/rank** | forward + backward + fused AdamW |
+| Bayesian/GQA six-layer, 2-rank DDP | 101.43M | BF16 projections + FP32 Bayesian state + fixed scalar Inductor recurrence | 128 × 512 per GPU | **586,609 tok/s global** | **68,849 MiB/rank** | forward + backward + fused AdamW |
 | Matched Mamba-3 SISO six-layer | 107.38M | BF16 | 128 × 512 per GPU | 495,529 tok/s | 64,921 MiB | forward + backward + fused AdamW |
 
 The recurrent state and covariance remain FP32. The selectable fused CUDA backend launches on the active PyTorch stream, so CUDA graph replay executes its Bayesian forward and reverse kernels on every step; it retains exact dense-covariance math while storing only chunk boundaries and recomputation intermediates.

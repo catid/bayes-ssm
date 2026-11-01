@@ -9,8 +9,8 @@ the hybrid model used in the repository's GB300 comparison:
 | 3, 6 | Causal GQA attention |
 
 Every block has a SwiGLU feed-forward network. The token embedding and output
-head are tied. The default width 640 / 10 query heads / 2 KV heads / 6144 MLP
-width / 32k vocabulary instantiates 101,425,536 trainable parameters (about
+head are tied. The default width 640 / 20 query heads / 4 KV heads / 6144 MLP
+width / 32k vocabulary instantiates 101,425,408 trainable parameters (about
 100M). Bayesian covariance and all recurrent reductions are kept in FP32;
 projection and MLP linears can use BF16 or TransformerEngine FP8.
 
