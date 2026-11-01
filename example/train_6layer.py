@@ -389,6 +389,10 @@ def _reduce_scalar(value: float, *, device: torch.device, op: dist.ReduceOp) -> 
 
 def run(args: argparse.Namespace) -> dict[str, object]:
     device, rank, world_size, local_rank, ddp_enabled = _distributed_context(args)
+    if args.bayes_backend == "inductor":
+        os.environ["BAYES_SSM_DISABLE_FUSED_CUDA"] = "1"
+    elif args.bayes_backend == "fused":
+        os.environ["BAYES_SSM_DISABLE_FUSED_CUDA"] = "0"
     if args.cuda_graph and device.type != "cuda":
         raise ValueError("--cuda-graph requires a CUDA device")
     # Every rank must initialize the model identically before DDP's parameter
@@ -594,6 +598,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             if optimized and os.environ.get("BAYES_SSM_DISABLE_FUSED_CUDA", "0") != "1"
             else ("exact dense covariance; Inductor fallback" if optimized else "exact dense covariance; eager")
         ),
+        "bayes_backend_requested": args.bayes_backend,
         "chunk_length": args.chunk_length,
         "cuda_graph": bool(args.cuda_graph),
         "gpu_batch_staging": bool(gpu_batches is not None),
@@ -637,6 +642,8 @@ def main() -> None:
     parser.add_argument("--chunk-length", type=int, default=64)
     parser.add_argument("--optimize-bayes", action="store_true",
                         help="use the compiled exact Bayesian core on CUDA")
+    parser.add_argument("--bayes-backend", choices=("auto", "fused", "inductor"), default="auto",
+                        help="select the exact CUDA replay kernel or Inductor fallback")
     parser.add_argument("--cuda-graph", action="store_true",
                         help="capture a fixed-shape forward/backward/AdamW step")
     parser.add_argument("--gpu-batch-staging", action="store_true",
