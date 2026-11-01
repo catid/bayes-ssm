@@ -36,8 +36,11 @@ the first shape incurs compilation. `--precision te-fp8` requires a
 CUDA-compatible TransformerEngine installation and fails explicitly when TE
 is unavailable. Every run prints JSON and can write it with `--output run.json`.
 
-The top-level README records the final GB300 smoke-training result and links
-to its JSON artifact. The graph path requires fixed batch and sequence shapes;
+The top-level README records the final GB300 training comparison and links to
+the JSON artifacts. The apples-to-apples Mamba-3 example uses Mamba-3 in
+blocks 1, 2, 4, and 5 and the same GQA attention in blocks 3 and 6;
+`--mixer all-mamba` is available only as a separate six-Mamba control. The
+graph path requires fixed batch and sequence shapes;
 use the default launch path when shapes change between steps. The short
 default run is intended to validate the model and training path; use a real
 token file and longer training schedule for language-model experiments.

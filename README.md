@@ -31,12 +31,22 @@ python example/train_6layer.py --device cuda:0 --precision bf16 \
   --seq 512 --batch 256 --steps 100 --warmup 5 --output run.json
 ```
 
-The recorded GB300 result below includes forward, backward, and fused AdamW updates. It uses fixed-shape CUDA graph capture, independently compiled GQA/SwiGLU components, the exact dense-covariance recurrence with the scalar-dynamics Inductor specialization, and two-rank NCCL DDP. Synthetic benchmark input staging is enabled only for the synthetic run; corpus-backed runs use the normal token loader. The first run pays the one-time component compilation cost. The final Bayesian record is [example/results/gb300_6layer_final.json](example/results/gb300_6layer_final.json), and the Mamba-3 baseline is in [example/results/gb300_6layer_mamba3_baseline.json](example/results/gb300_6layer_mamba3_baseline.json).
+The matched Mamba-3/GQA run uses the same fixed shape and optimizer settings:
 
-| Model | Parameters | Precision | Batch × sequence | Throughput | Peak VRAM | Step scope |
-|---|---:|---|---:|---:|---:|---|
-| Bayesian/GQA six-layer, 2-rank DDP | **100.60M** | BF16 projections + TE fused RMSNorm + compiled GQA/SwiGLU + FP32 Bayesian state | 256 × 512 per GPU | **985,761 tok/s global** | **122,581 MiB/rank** | forward + backward + fused AdamW |
-| Matched Mamba-3 SISO six-layer | 107.38M | BF16 | 128 × 512 per GPU | 495,529 tok/s | 64,921 MiB | forward + backward + fused AdamW |
+```bash
+python example/train_6layer_mamba3.py --device cuda:0 --precision bf16 \
+  --fused-rmsnorm --compile-ffn --mixer hybrid --width 512 --heads 64 \
+  --kv-heads 4 --mlp-width 8258 --seq 512 --batch 256 --steps 60 --warmup 20 \
+  --cuda-graph --gpu-batch-staging --output mamba3_hybrid.json
+```
+
+The recorded GB300 result below includes forward, backward, and fused AdamW updates. It uses fixed-shape CUDA graph capture, independently compiled GQA/SwiGLU components, the exact dense-covariance recurrence with the scalar-dynamics Inductor specialization, and two-rank NCCL DDP. Synthetic benchmark input staging is enabled only for the synthetic run; corpus-backed runs use the normal token loader. The first run pays the one-time component compilation cost. The final Bayesian record is [example/results/gb300_6layer_final.json](example/results/gb300_6layer_final.json). The corrected hybrid Mamba-3 record is [example/results/gb300_6layer_mamba3_hybrid.json](example/results/gb300_6layer_mamba3_hybrid.json); the earlier six-Mamba measurement is retained as an explicitly labeled control in [example/results/gb300_6layer_mamba3_apples.json](example/results/gb300_6layer_mamba3_apples.json). Both Mamba runs use [example/train_6layer_mamba3.py](example/train_6layer_mamba3.py). Every row below is a complete forward, backward, gradient-clipping, and fused-AdamW step on two GB300 ranks, with batch and sequence shown per GPU.
+
+| Model | Parameters | Mixer layout | Precision and state | Batch × sequence / GPU | Throughput (global / per GPU) | Peak VRAM allocated / reserved / rank | Validation loss / PPL |
+|---|---:|---|---|---:|---:|---:|---:|
+| Bayesian/GQA six-layer | **100.604M** | Bayes, Bayes, GQA, Bayes, Bayes, GQA | BF16 projections + TE fused RMSNorm + FP32 Bayesian state and tied vocabulary head | 256 × 512 | **985,761 / 492,880 tok/s** | **122,581 / 163,268 MiB** | 10.3793 / 32,187 |
+| Mamba-3/GQA hybrid | **100.608M** | Mamba-3, Mamba-3, GQA, Mamba-3, Mamba-3, GQA | BF16 projections + TE fused RMSNorm + FP32 tied vocabulary head | 256 × 512 | **1,059,506 / 529,753 tok/s** | **118,589 / 164,714 MiB** | 10.3473 / 31,172 |
+| Mamba-3 all-Mamba control | **100.614M** | Six Mamba-3 SISO mixers | BF16 projections + TE fused RMSNorm + FP32 tied vocabulary head | 256 × 512 | **1,356,200 / 678,100 tok/s** | **122,724 / 170,970 MiB** | 10.3578 / 31,484 |
 
 The recurrent state and covariance remain FP32. The selectable fused CUDA backend launches on the active PyTorch stream, so CUDA graph replay executes its Bayesian forward and reverse kernels on every step; it retains exact dense-covariance math while storing only chunk boundaries and recomputation intermediates.
 
