@@ -251,6 +251,61 @@ def _core_loop_diagonal_transition(
     return torch.stack(outputs, dim=-2), mean, covariance
 
 
+def _core_loop_fixed_diagonal(
+    keys: Tensor,
+    values: Tensor,
+    queries: Tensor,
+    transition_diagonals: Tensor,
+    process_variances: Tensor,
+    observation_variances: Tensor,
+    mean: Tensor,
+    covariance: Tensor,
+    denominator_floor: float,
+) -> Tuple[Tensor, Tensor, Tensor]:
+    """Exact fixed-dynamics core for the production ``0.97/0.1/1`` case.
+
+    The six-layer recipe uses a constant diagonal transition, isotropic process
+    noise, and unit observation noise.  Keeping those constants in the kernel
+    removes the per-token dense predicted-covariance temporary and avoids
+    reading three broadcast parameter tensors.  ``transition_diagonals`` and
+    the noise arguments remain in the signature so the compiled callable has
+    the same state/autograd boundary as the general specialization; callers
+    select this function only after opting into ``fixed_dynamics``.
+    """
+    outputs = []
+    eye = torch.eye(keys.shape[-1], device=keys.device, dtype=keys.dtype)
+    rho = 0.97
+    rho2 = rho * rho
+    process = 0.1
+    observation = 1.0
+    for i in range(keys.shape[-2]):
+        key = keys[..., i, :]
+        predicted_mean = rho * mean
+        # Compute P'k without materializing P' = rho²P + qI.  The covariance
+        # update below uses the same expression, preserving dense covariance.
+        uncertainty_key = rho2 * torch.sum(
+            covariance * key[..., None, :], dim=-1
+        ) + process * key
+        innovation_variance = observation + torch.sum(
+            key * uncertainty_key, dim=-1
+        )
+        beta = innovation_variance.clamp_min(denominator_floor).reciprocal()
+        innovation = values[..., i, :] - torch.sum(
+            predicted_mean * key[..., :, None], dim=-2
+        )
+        mean = predicted_mean + beta[..., None, None] * uncertainty_key[..., :, None] * innovation[..., None, :]
+        # Every term is symmetric for scalar rho, isotropic process noise, and
+        # the rank-one Kalman update.  Skipping a transpose average removes a
+        # full D×D pass while preserving the FP32 covariance state.
+        covariance = (
+            rho2 * covariance
+            + process * eye
+            - beta[..., None, None] * uncertainty_key[..., :, None] * uncertainty_key[..., None, :]
+        )
+        outputs.append(torch.sum(mean * queries[..., i, :, None], dim=-2))
+    return torch.stack(outputs, dim=-2), mean, covariance
+
+
 _COMPILED_CORES: dict[tuple[object, ...], object] = {}
 _MAX_COMPILED_CORES = 32
 _COMPILED_FALLBACK_WARNED: set[tuple[object, ...]] = set()
@@ -430,6 +485,43 @@ def _run_compiled_diagonal_transition(*args):
         return _core_loop_diagonal_transition(*args)
 
 
+def _run_compiled_fixed_diagonal(*args):
+    """Compile/cache the constant-dynamics diagonal specialization."""
+    mode = _compiled_core_mode()
+    key = ("fixed-diagonal", "mode", mode) + _compiled_core_key(args)
+    compiled_core = _COMPILED_CORES.get(key)
+    if compiled_core is None:
+        compiled_core = torch.compile(
+            _core_loop_fixed_diagonal, fullgraph=False, dynamic=False, mode=mode
+        )
+        _COMPILED_CORES[key] = compiled_core
+        if len(_COMPILED_CORES) > _MAX_COMPILED_CORES:
+            _COMPILED_CORES.pop(next(iter(_COMPILED_CORES)))
+    try:
+        needs_clone = _compiled_outputs_need_clone()
+        mark_step_begin = getattr(torch.compiler, "cudagraph_mark_step_begin", None)
+        if mark_step_begin is not None and args[0].is_cuda and needs_clone:
+            mark_step_begin()
+        output = compiled_core(*args)
+        if needs_clone:
+            return tuple(value.clone() for value in output)
+        return output
+    except _COMPILE_FALLBACK_EXCEPTIONS as exc:
+        if _is_cuda_graph_capturing(args[0]) and _compiled_core_mode() != "default":
+            raise RuntimeError(
+                "Bayesian fixed diagonal core fell back while a CUDA graph was being captured"
+            ) from exc
+        if key not in _COMPILED_FALLBACK_WARNED:
+            _COMPILED_FALLBACK_WARNED.add(key)
+            warnings.warn(
+                "Bayesian fixed diagonal core fell back to eager execution "
+                f"for shape key {key!r}: {type(exc).__name__}: {exc}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        return _core_loop_fixed_diagonal(*args)
+
+
 class _CheckpointedCoreFunction(torch.autograd.Function):
     """Mamba-style custom autograd boundary for one dense Bayesian chunk.
 
@@ -595,10 +687,10 @@ def bayesian_layer(
             the full covariance equations. The environment variable
             ``MEMORY_BY_DESIGN_CHECKPOINTED_BACKWARD=1`` enables the same
             boundary globally.
-        fixed_dynamics: use the compile-time ``A=0.97I, Q=0.1I, R=1`` CUDA
-            specialization when the fused path is selected. This is an exact
-            specialization for those constants and is ignored by fallback
-            implementations.
+        fixed_dynamics: assert the compile-time ``A=0.97I, Q=0.1I, R=1``
+            dynamics used by the six-layer recipe. This selects the exact
+            scalar-dynamics specialization for Inductor and the fused CUDA
+            path; callers using other dynamics must leave it false.
 
     Inputs with float16, bfloat16, or any available float8 dtype are promoted
     to float32 for the recurrent state and readouts.  This is intentional: the
@@ -843,13 +935,22 @@ def bayesian_layer(
             mean = mean.contiguous()
             covariance = covariance.contiguous()
             if diagonal_transition is not None and process_covariances is None and not checkpointed:
-                output, mean, covariance = _run_compiled_diagonal_transition(
+                core_args = (
                     keys[..., start:stop, :], values[..., start:stop, :],
                     queries[..., start:stop, :], diagonal_transition[..., start:stop, :],
                     process_variances[..., start:stop],
                     observation_variances[..., start:stop], mean, covariance,
                     float(denominator_floor),
                 )
+                if (
+                    fixed_dynamics
+                    and not diagonal_transition.requires_grad
+                    and not process_variances.requires_grad
+                    and not observation_variances.requires_grad
+                ):
+                    output, mean, covariance = _run_compiled_fixed_diagonal(*core_args)
+                else:
+                    output, mean, covariance = _run_compiled_diagonal_transition(*core_args)
             else:
                 if diagonal_transition is not None and process_covariances is None:
                     eye = torch.eye(d, device=device, dtype=dtype)
