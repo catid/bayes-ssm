@@ -8,8 +8,8 @@ SwiGLU feed-forward network and the output projection is tied to the token
 embedding.
 
 The defaults are the approximately 100M-parameter configuration used in the
-GB300 measurements (width 640, 20 query heads, 4 KV heads, and MLP width
-6144).  A small CPU run is useful as a smoke test::
+GB300 measurements (width 512, 64 query heads, 4 KV heads, and MLP width
+8448).  A small CPU run is useful as a smoke test::
 
     python example/train_6layer.py --device cpu --width 32 --heads 4 \
         --kv-heads 2 --mlp-width 64 --vocab-size 256 --seq 32 --batch 2 \
@@ -274,10 +274,10 @@ class SixLayerLM(nn.Module):
     def __init__(
         self,
         vocab_size: int = 32_000,
-        width: int = 640,
-        heads: int = 20,
+        width: int = 512,
+        heads: int = 64,
         kv_heads: int = 4,
-        mlp_width: int = 6144,
+        mlp_width: int = 8448,
         *,
         factory: LinearFactory,
         optimized: bool = False,
@@ -670,7 +670,7 @@ def main() -> None:
     )
     parser.add_argument("--vocab-size", type=int, default=32_000)
     parser.add_argument("--width", type=int, default=512)
-    parser.add_argument("--heads", type=int, default=16)
+    parser.add_argument("--heads", type=int, default=64)
     parser.add_argument("--kv-heads", type=int, default=4)
     parser.add_argument("--mlp-width", type=int, default=8448)
     parser.add_argument("--seq", type=int, default=512)

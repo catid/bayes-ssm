@@ -1,5 +1,5 @@
 {
-  "schema": "bayes-ssm-six-layer-gb300-v12",
+  "schema": "bayes-ssm-six-layer-gb300-v13",
   "device": "NVIDIA GB300",
   "world_size": 2,
   "model": {
@@ -11,9 +11,9 @@
       "bayesian",
       "fa-gqa"
     ],
-    "parameters": 100801152,
+    "parameters": 100604448,
     "width": 512,
-    "heads": 16,
+    "heads": 64,
     "kv_heads": 4,
     "mlp_width": 8448,
     "vocab_size": 32000,
@@ -34,12 +34,12 @@
   "timed_steps": 60,
   "warmup_steps": 20,
   "dataset": "synthetic random token stream (seed 123)",
-  "tokens_per_second_global": 800296.4608550684,
-  "elapsed_seconds": 19.653516876976937,
-  "peak_allocated_mib_per_rank": 130934.46728515625,
-  "peak_reserved_mib_per_rank": 172154.0,
-  "final_train_loss": 10.377513408660889,
-  "validation_loss": 10.377362251281738,
-  "validation_perplexity": 32124.114296540367,
+  "tokens_per_second_global": 985760.8465064074,
+  "elapsed_seconds": 15.95583762100432,
+  "peak_allocated_mib_per_rank": 122580.96728515625,
+  "peak_reserved_mib_per_rank": 163268.0,
+  "final_train_loss": 10.380606651306152,
+  "validation_loss": 10.379320621490479,
+  "validation_perplexity": 32187.0868466178,
   "measurement": "full forward, backward, and optimizer step"
 }
