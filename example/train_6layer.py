@@ -425,6 +425,20 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         args.vocab_size, args.width, args.heads, args.kv_heads, args.mlp_width,
         factory=factory, optimized=optimized, chunk_length=args.chunk_length,
     ).to(device)
+    # Compile the dense attention and SwiGLU components independently.  This
+    # preserves the custom Bayesian recurrence boundary while fusing the
+    # projection/activation backward graphs.  It is optional because the first
+    # run pays the one-time Dynamo/Inductor compilation cost.
+    if args.compile_components != "none":
+        for block in model.blocks:
+            if args.compile_components in ("gqa", "both") and isinstance(block.mixer, GQAAttention):
+                block.mixer = torch.compile(
+                    block.mixer, fullgraph=False, dynamic=False, mode="default"
+                )
+            if args.compile_components in ("swiglu", "both"):
+                block.ffn = torch.compile(
+                    block.ffn, fullgraph=False, dynamic=False, mode="default"
+                )
     if ddp_enabled:
         model = DDP(
             model,
@@ -611,6 +625,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         "precision_requested": args.precision,
         "precision_active": factory.active,
         "fused_rmsnorm": bool(args.fused_rmsnorm),
+        "compile_components": args.compile_components,
         "bayesian_core": (
             "exact dense covariance; fused CUDA chunk replay"
             if optimized and os.environ.get("BAYES_SSM_DISABLE_FUSED_CUDA", "0") != "1"
@@ -649,11 +664,15 @@ def main() -> None:
         "--fused-rmsnorm", action="store_true",
         help="use TransformerEngine's fused RMSNorm (CUDA + TransformerEngine required)",
     )
+    parser.add_argument(
+        "--compile-components", choices=("none", "gqa", "swiglu", "both"), default="none",
+        help="compile selected GQA/SwiGLU modules independently",
+    )
     parser.add_argument("--vocab-size", type=int, default=32_000)
-    parser.add_argument("--width", type=int, default=640)
-    parser.add_argument("--heads", type=int, default=20)
+    parser.add_argument("--width", type=int, default=512)
+    parser.add_argument("--heads", type=int, default=16)
     parser.add_argument("--kv-heads", type=int, default=4)
-    parser.add_argument("--mlp-width", type=int, default=6144)
+    parser.add_argument("--mlp-width", type=int, default=8448)
     parser.add_argument("--seq", type=int, default=512)
     parser.add_argument("--batch", type=int, default=1)
     parser.add_argument("--steps", type=int, default=20)

@@ -210,7 +210,10 @@ __global__ void chunk_forward_kernel(
      // The fixed recurrence preserves symmetry. Compute each upper-triangle
      // entry once and mirror it, halving the covariance update arithmetic.
      int i=tid & (D-1), lane=tid >> 6;
-     for(int j=i+lane;j<D;j+=2){
+     // With 256 threads there are four lanes per row; stride by four so each
+     // upper-triangle entry has exactly one writer.  The old stride-2 loop
+     // made lanes 0/2 (and 1/3) race on the same covariance entries.
+     for(int j=i+lane;j<D;j+=4){
        float value=0.9409f*cov[i*D+j]+(i==j?0.1f:0.f)-beta*u[i]*u[j];
        cov[i*D+j]=value;cov[j*D+i]=value;
      }
@@ -254,7 +257,8 @@ __global__ void recompute_chunk_kernel(
    for(int x=tid;x<D*M;x+=THREADS){int i=x/M,c=x%M;mean[x]=(FIXED?0.97f:d[i])*mean[x]+beta*u[i]*err[c];}__syncthreads();
    if constexpr (FIXED) {
      int i=tid & (D-1), lane=tid >> 6;
-     for(int j=i+lane;j<D;j+=2){
+     // Match the four-lane 256-thread launch; avoid duplicate writers.
+     for(int j=i+lane;j<D;j+=4){
        float value=0.9409f*cov[i*D+j]+(i==j?0.1f:0.f)-beta*u[i]*u[j];
        cov[i*D+j]=value;cov[j*D+i]=value;
      }
@@ -322,7 +326,7 @@ std::vector<torch::Tensor> forward_chunked(
 std::vector<torch::Tensor> forward_chunked_fixed(
  torch::Tensor keys,torch::Tensor values,torch::Tensor queries,torch::Tensor decay,torch::Tensor process,torch::Tensor observation,torch::Tensor mean0,torch::Tensor cov0,int chunks,double floor){
  TORCH_CHECK(keys.is_cuda() && values.is_cuda() && queries.is_cuda(), "fused Bayesian CUDA inputs must be CUDA tensors");
- int n=keys.size(0),t=keys.size(1),nb=(t+chunks-1)/chunks;auto out=torch::empty({n,t,64},keys.options()),mf=torch::empty_like(mean0),cf=torch::empty_like(cov0),bm=torch::empty({n,nb+1,64,64},keys.options()),bc=torch::empty({n,nb+1,64,64},keys.options());constexpr int th=128;size_t sh=(2*64*64+3*64)*sizeof(float);cudaFuncSetAttribute(chunk_forward_kernel<64,64,th,true>,cudaFuncAttributeMaxDynamicSharedMemorySize,(int)sh);auto st=at::cuda::getCurrentCUDAStream();chunk_forward_kernel<64,64,th,true><<<n,th,sh,st>>>(keys.data_ptr<float>(),values.data_ptr<float>(),queries.data_ptr<float>(),decay.data_ptr<float>(),process.data_ptr<float>(),observation.data_ptr<float>(),mean0.data_ptr<float>(),cov0.data_ptr<float>(),out.data_ptr<float>(),mf.data_ptr<float>(),cf.data_ptr<float>(),bm.data_ptr<float>(),bc.data_ptr<float>(),n,t,chunks,nb,(float)floor);C10_CUDA_KERNEL_LAUNCH_CHECK();return {out,mf,cf,bm,bc};
+ int n=keys.size(0),t=keys.size(1),nb=(t+chunks-1)/chunks;auto out=torch::empty({n,t,64},keys.options()),mf=torch::empty_like(mean0),cf=torch::empty_like(cov0),bm=torch::empty({n,nb+1,64,64},keys.options()),bc=torch::empty({n,nb+1,64,64},keys.options());constexpr int th=256;size_t sh=(2*64*64+3*64)*sizeof(float);cudaFuncSetAttribute(chunk_forward_kernel<64,64,th,true>,cudaFuncAttributeMaxDynamicSharedMemorySize,(int)sh);auto st=at::cuda::getCurrentCUDAStream();chunk_forward_kernel<64,64,th,true><<<n,th,sh,st>>>(keys.data_ptr<float>(),values.data_ptr<float>(),queries.data_ptr<float>(),decay.data_ptr<float>(),process.data_ptr<float>(),observation.data_ptr<float>(),mean0.data_ptr<float>(),cov0.data_ptr<float>(),out.data_ptr<float>(),mf.data_ptr<float>(),cf.data_ptr<float>(),bm.data_ptr<float>(),bc.data_ptr<float>(),n,t,chunks,nb,(float)floor);C10_CUDA_KERNEL_LAUNCH_CHECK();return {out,mf,cf,bm,bc};
 }
 
 template<bool NEED_DYNAMICS,bool FIXED=false>

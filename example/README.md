@@ -9,14 +9,17 @@ the hybrid model used in the repository's GB300 comparison:
 | 3, 6 | Causal GQA attention |
 
 Every block has a SwiGLU feed-forward network. The token embedding and output
-head are tied. The default width 640 / 20 query heads / 4 KV heads / 6144 MLP
-width / 32k vocabulary instantiates 101,425,408 trainable parameters (about
+head are tied. The default width 512 / 16 query heads / 4 KV heads / 8448 MLP
+width / 32k vocabulary instantiates 100,801,152 trainable parameters (about
 100M). Bayesian covariance and all recurrent reductions are kept in FP32;
 projection and MLP linears can use BF16 or TransformerEngine FP8.
 
 On CUDA with TransformerEngine installed, `--fused-rmsnorm` selects
 TransformerEngine's fused RMSNorm while leaving projections in the requested
 precision. The flag is optional and is rejected clearly on CPU or without TE.
+`--compile-components both` independently compiles the GQA and SwiGLU modules;
+the first run pays the compilation cost, while fixed-shape replays use the
+compiled backward graphs.
 
 Run a CPU smoke test with synthetic tokens:
 
