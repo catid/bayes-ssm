@@ -11,7 +11,7 @@
     "mlp_width": 6144,
     "vocab_size": 32000,
     "sequence_length": 512,
-    "batch_per_rank": 128,
+    "batch_per_rank": 256,
     "batch_scope": "per GPU"
   },
   "precision": "BF16 projections with FP32 Bayesian state",
@@ -25,12 +25,12 @@
   "timed_steps": 60,
   "warmup_steps": 20,
   "dataset": "synthetic random token stream (seed 123)",
-  "tokens_per_second_global": 586608.8802870257,
-  "elapsed_seconds": 13.4064114340581,
-  "peak_allocated_mib_per_rank": 68849.24365234375,
-  "peak_reserved_mib_per_rank": 93208.0,
-  "final_train_loss": 10.382911205291748,
-  "validation_loss": 10.382023334503174,
-  "validation_perplexity": 32274.196968883603,
+  "tokens_per_second_global": 657722.3777201691,
+  "elapsed_seconds": 23.913797877030447,
+  "peak_allocated_mib_per_rank": 136751.42724609375,
+  "peak_reserved_mib_per_rank": 176766.0,
+  "final_train_loss": 10.38015365600586,
+  "validation_loss": 10.379882335662842,
+  "validation_perplexity": 32205.171868297606,
   "measurement": "full forward, backward, and optimizer step"
 }
