@@ -1,5 +1,5 @@
 {
-  "schema": "bayes-ssm-six-layer-gb300-v10",
+  "schema": "bayes-ssm-six-layer-gb300-v11",
   "device": "NVIDIA GB300",
   "world_size": 2,
   "model": {
@@ -14,10 +14,11 @@
     "batch_per_rank": 256,
     "batch_scope": "per GPU"
   },
-  "precision": "BF16 projections with FP32 Bayesian state",
+  "precision": "BF16 projections + TransformerEngine fused RMSNorm with FP32 Bayesian state",
   "optimizer": "capturable fused AdamW",
   "bayesian_core": "exact dense covariance; fixed scalar Inductor recurrence",
   "bayes_backend_requested": "inductor",
+  "fused_rmsnorm": true,
   "cuda_graph": true,
   "gpu_batch_staging": true,
   "chunk_length": 64,
@@ -25,12 +26,12 @@
   "timed_steps": 60,
   "warmup_steps": 20,
   "dataset": "synthetic random token stream (seed 123)",
-  "tokens_per_second_global": 657722.3777201691,
-  "elapsed_seconds": 23.913797877030447,
+  "tokens_per_second_global": 670772.0407191096,
+  "elapsed_seconds": 23.44856232102029,
   "peak_allocated_mib_per_rank": 136751.42724609375,
   "peak_reserved_mib_per_rank": 176766.0,
-  "final_train_loss": 10.38015365600586,
-  "validation_loss": 10.379882335662842,
-  "validation_perplexity": 32205.171868297606,
+  "final_train_loss": 10.378070831298828,
+  "validation_loss": 10.378376483917236,
+  "validation_perplexity": 32156.712149755313,
   "measurement": "full forward, backward, and optimizer step"
 }

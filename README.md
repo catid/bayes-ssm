@@ -27,7 +27,7 @@ The [`example/`](example/) directory contains a runnable causal language-model r
 
 ```bash
 python example/train_6layer.py --device cuda:0 --precision bf16 \
-  --optimize-bayes --bayes-backend inductor --cuda-graph --tokens train.npy --valid-tokens valid.npy \
+  --fused-rmsnorm --optimize-bayes --bayes-backend inductor --cuda-graph --tokens train.npy --valid-tokens valid.npy \
   --seq 512 --batch 256 --steps 100 --warmup 5 --output run.json
 ```
 
@@ -35,7 +35,7 @@ The recorded GB300 result below includes forward, backward, and fused AdamW upda
 
 | Model | Parameters | Precision | Batch × sequence | Throughput | Peak VRAM | Step scope |
 |---|---:|---|---:|---:|---:|---|
-| Bayesian/GQA six-layer, 2-rank DDP | 101.43M | BF16 projections + FP32 Bayesian state + fixed scalar Inductor recurrence | 256 × 512 per GPU | **657,722 tok/s global** | **136,751 MiB/rank** | forward + backward + fused AdamW |
+| Bayesian/GQA six-layer, 2-rank DDP | 101.43M | BF16 projections + TE fused RMSNorm + FP32 Bayesian state + fixed scalar Inductor recurrence | 256 × 512 per GPU | **670,772 tok/s global** | **136,751 MiB/rank** | forward + backward + fused AdamW |
 | Matched Mamba-3 SISO six-layer | 107.38M | BF16 | 128 × 512 per GPU | 495,529 tok/s | 64,921 MiB | forward + backward + fused AdamW |
 
 The recurrent state and covariance remain FP32. The selectable fused CUDA backend launches on the active PyTorch stream, so CUDA graph replay executes its Bayesian forward and reverse kernels on every step; it retains exact dense-covariance math while storing only chunk boundaries and recomputation intermediates.

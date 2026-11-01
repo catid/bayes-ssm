@@ -14,6 +14,10 @@ width / 32k vocabulary instantiates 101,425,408 trainable parameters (about
 100M). Bayesian covariance and all recurrent reductions are kept in FP32;
 projection and MLP linears can use BF16 or TransformerEngine FP8.
 
+On CUDA with TransformerEngine installed, `--fused-rmsnorm` selects
+TransformerEngine's fused RMSNorm while leaving projections in the requested
+precision. The flag is optional and is rejected clearly on CPU or without TE.
+
 Run a CPU smoke test with synthetic tokens:
 
 ```bash

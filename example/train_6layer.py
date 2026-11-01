@@ -46,14 +46,16 @@ from bayes_ssm.bayesian_layer import bayesian_layer
 
 
 class LinearFactory:
-    """Create ordinary linears or TransformerEngine FP8 linears."""
+    """Create projection and normalization modules for one precision policy."""
 
-    def __init__(self, precision: str, device: torch.device) -> None:
+    def __init__(self, precision: str, device: torch.device, *, fused_rmsnorm: bool = False) -> None:
         if precision not in {"fp32", "bf16", "te-fp8"}:
             raise ValueError(f"unknown precision {precision!r}")
         self.requested = precision
         self.device = device
+        self.fused_rmsnorm = bool(fused_rmsnorm)
         self.te = None
+        self._rms_te = None
         self._recipe_types = None
         if precision == "te-fp8":
             try:
@@ -72,6 +74,16 @@ class LinearFactory:
         self.dtype = torch.bfloat16 if self.active == "te-fp8" else (
             torch.bfloat16 if precision == "bf16" else torch.float32
         )
+        if self.fused_rmsnorm:
+            if device.type != "cuda":
+                raise RuntimeError("--fused-rmsnorm requires a CUDA device")
+            try:
+                import transformer_engine.pytorch as te
+            except (ImportError, ModuleNotFoundError) as exc:
+                raise RuntimeError(
+                    "--fused-rmsnorm requires a CUDA-compatible TransformerEngine installation"
+                ) from exc
+            self._rms_te = te
 
     def linear(self, in_features: int, out_features: int, *, bias: bool = False) -> nn.Module:
         if self.te is not None:
@@ -79,6 +91,11 @@ class LinearFactory:
                 in_features, out_features, bias=bias, params_dtype=torch.bfloat16
             )
         return nn.Linear(in_features, out_features, bias=bias, dtype=self.dtype)
+
+    def rms_norm(self, hidden_size: int) -> nn.Module:
+        if self._rms_te is not None:
+            return self._rms_te.RMSNorm(hidden_size, dtype=self.dtype)
+        return nn.RMSNorm(hidden_size, dtype=self.dtype)
 
     @contextlib.contextmanager
     def autocast(self) -> Iterator[None]:
@@ -105,7 +122,7 @@ class GQAAttention(nn.Module):
         self.heads = heads
         self.kv_heads = kv_heads
         self.head_dim = width // heads
-        self.norm = nn.RMSNorm(width, dtype=factory.dtype)
+        self.norm = factory.rms_norm(width)
         self.q_proj = factory.linear(width, width)
         self.k_proj = factory.linear(width, kv_heads * self.head_dim)
         self.v_proj = factory.linear(width, kv_heads * self.head_dim)
@@ -145,12 +162,12 @@ class BayesianMixer(nn.Module):
         self.width, self.heads, self.head_dim = width, heads, width // heads
         self.optimized = optimized
         self.chunk_length = chunk_length
-        self.norm = nn.RMSNorm(width, dtype=factory.dtype)
+        self.norm = factory.rms_norm(width)
         self.q_proj = factory.linear(width, width)
         self.k_proj = factory.linear(width, width)
         self.v_proj = factory.linear(width, width)
         self.out_proj = factory.linear(width, width)
-        self.read_norm = nn.RMSNorm(self.head_dim, dtype=factory.dtype)
+        self.read_norm = factory.rms_norm(self.head_dim)
         # CroissAttn's gated readout keeps the recurrent contribution bounded
         # before it is added to the residual stream.  The gate is projected
         # from the same normalized input as Q/K/V and is applied per head.
@@ -209,7 +226,7 @@ class BayesianMixer(nn.Module):
 class SwiGLU(nn.Module):
     def __init__(self, width: int, mlp_width: int, factory: LinearFactory):
         super().__init__()
-        self.norm = nn.RMSNorm(width, dtype=factory.dtype)
+        self.norm = factory.rms_norm(width)
         self.gate = factory.linear(width, mlp_width)
         self.up = factory.linear(width, mlp_width)
         self.down = factory.linear(mlp_width, width)
@@ -278,7 +295,7 @@ class SixLayerLM(nn.Module):
             )
             for kind in self.block_kinds
         )
-        self.final_norm = nn.RMSNorm(width, dtype=factory.dtype)
+        self.final_norm = factory.rms_norm(width)
 
     def forward(self, tokens: Tensor, factory: LinearFactory) -> Tensor:
         x = self.embedding(tokens)
@@ -402,7 +419,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         torch.manual_seed(args.seed)
         if device.type == "cuda":
             torch.cuda.manual_seed_all(args.seed)
-    factory = LinearFactory(args.precision, device)
+    factory = LinearFactory(args.precision, device, fused_rmsnorm=args.fused_rmsnorm)
     optimized = bool(args.optimize_bayes and device.type == "cuda")
     model = SixLayerLM(
         args.vocab_size, args.width, args.heads, args.kv_heads, args.mlp_width,
@@ -593,6 +610,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         "steps": args.steps,
         "precision_requested": args.precision,
         "precision_active": factory.active,
+        "fused_rmsnorm": bool(args.fused_rmsnorm),
         "bayesian_core": (
             "exact dense covariance; fused CUDA chunk replay"
             if optimized and os.environ.get("BAYES_SSM_DISABLE_FUSED_CUDA", "0") != "1"
@@ -627,6 +645,10 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--precision", choices=("fp32", "bf16", "te-fp8"), default="bf16")
+    parser.add_argument(
+        "--fused-rmsnorm", action="store_true",
+        help="use TransformerEngine's fused RMSNorm (CUDA + TransformerEngine required)",
+    )
     parser.add_argument("--vocab-size", type=int, default=32_000)
     parser.add_argument("--width", type=int, default=640)
     parser.add_argument("--heads", type=int, default=20)
