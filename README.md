@@ -163,6 +163,19 @@ and [Mamba-3](example/results/gb300_6layer_mamba3_tefp8_match_b120.json).
 
 Use `--bayes-backend fused` when the lower-memory custom CUDA replay path is preferred. The recorded paper-feature result uses the Inductor backend with learned input-dependent dynamics; backend rankings can change with sequence length and batch shape.
 
+The D8 kernel has since received two exact SM103 optimizations: the forward
+covariance prediction is folded into the covariance-key matvec, and the
+backward decay gradient hoists the per-row reciprocal of the input-dependent
+decay.  On a GB300 with `N=8192, T=512, D=M=8`, full dynamic forward plus
+backward through all Q/K/V, decay, process-noise, and observation-noise inputs
+measured **16.09 ms → 15.00 ms (6.8%)** over ten synchronized runs.  The
+maximum differences against the dense PyTorch reference were `7.2e-7` in the
+forward outputs and `1.9e-6` in gradients.  Dense covariance, FP32 state, and
+all paper input dependencies remain enabled.  The experimental on-chip
+replay fusion is kept behind `BAYES_SSM_FUSED_REPLAY=1`; it is disabled by
+default because its larger shared-memory history lowers occupancy on this
+shape.
+
 The paper's damped rotational variant is available with
 `--bayes-dynamics rotation`. It embeds each scalar Q/K component as
 `(component, 0)`, learns an input-dependent radius and angle for every 2-D
