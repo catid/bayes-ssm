@@ -200,6 +200,19 @@ class BayesianMixer(nn.Module):
         self.fuse_paper_projection = bool(
             fuse_paper_projection and self.fuse_paper_qkv and not te_active
         )
+        # The per-head read gate consumes the same normalized stream as the
+        # Bayesian projections.  In BF16/FP32, append it to the fused GEMM so
+        # four small launches (Q/K/V and gate) become one.  Keep TE's gate
+        # projection separate because a shared FP8 amax scale would couple the
+        # gate and state-input ranges.
+        self.fuse_gate_projection = bool(
+            bayes_features == "paper" and self.fuse_paper_qkv and not te_active
+        )
+        self.qkv_core_width = 2 * self.state_width + width
+        self.aux_width = (
+            self.state_width + 2 * heads
+            if self.fuse_paper_projection and bayes_dynamics == "learned" else 0
+        )
         self.norm = factory.rms_norm(width)
         if bayes_features == "paper":
             # Memory by Design's language/MQAR path uses three independent
@@ -217,9 +230,9 @@ class BayesianMixer(nn.Module):
                 # block while retaining the exact paper equations.  Keep the
                 # legacy three-module path available for state-dict parity and
                 # CPU/reference checks.
-                projection_width = 2 * self.state_width + width
-                if self.fuse_paper_projection and bayes_dynamics == "learned":
-                    projection_width += self.state_width + 2 * heads
+                projection_width = self.qkv_core_width + self.aux_width
+                if self.fuse_gate_projection:
+                    projection_width += width
                 self.qkv_proj = factory.linear(
                     width, projection_width,
                     # Legacy Q/K/V projections are bias-free.  Keep the
@@ -228,9 +241,9 @@ class BayesianMixer(nn.Module):
                     bias=False,
                 )
                 self.aux_bias = None
-                if self.fuse_paper_projection and bayes_dynamics == "learned":
+                if self.aux_width:
                     self.aux_bias = nn.Parameter(
-                        torch.zeros(self.state_width + 2 * heads, dtype=factory.dtype,
+                        torch.zeros(self.aux_width, dtype=factory.dtype,
                                     device=self.qkv_proj.weight.device)
                     )
                 self.qkv_conv = nn.Conv1d(
@@ -314,7 +327,9 @@ class BayesianMixer(nn.Module):
                     # Standalone noise/decay projections are zero initialized;
                     # preserve that stable paper initialization in the fused
                     # rows while retaining their learned gradients.
-                    self.qkv_proj.weight.data[2 * self.state_width + width :].zero_()
+                    self.qkv_proj.weight.data[
+                        self.qkv_core_width : self.qkv_core_width + self.aux_width
+                    ].zero_()
                     aux_bias.data[:self.state_width].copy_(raw.to(aux_bias.dtype))
                     aux_bias.data[self.state_width : self.state_width + 2 * heads : 2].fill_(math.log(math.expm1(0.1)))
                     aux_bias.data[self.state_width + 1 : self.state_width + 2 * heads : 2].fill_(math.log(math.expm1(1.0)))
@@ -349,7 +364,7 @@ class BayesianMixer(nn.Module):
         # CroissAttn's gated readout keeps the recurrent contribution bounded
         # before it is added to the residual stream.  The gate is projected
         # from the same normalized input as Q/K/V and is applied per head.
-        self.g_proj = factory.linear(width, width)
+        self.g_proj = None if self.fuse_gate_projection else factory.linear(width, width)
         # A fixed, stable diagonal transition is the default production path;
         # covariance itself remains dense in bayesian_layer.
         self.register_buffer("decay", torch.full((1, 1, self.key_dim), 0.97), persistent=False)
@@ -400,6 +415,19 @@ class BayesianMixer(nn.Module):
                 state_dict[aux_key] = torch.cat(
                     (state_dict.pop(decay_b_key), state_dict.pop(noise_b_key)), dim=0
                 )
+            # Checkpoints from the previous fused layout have Q/K/V plus
+            # auxiliary rows but a separate gate projection. Move that gate
+            # into the new fused GEMM so loading preserves the exact function.
+            qkv = state_dict.get(qkv_key)
+            if qkv is not None and tuple(qkv.shape) != tuple(expected):
+                old_aux_rows = self.aux_width
+                old_rows = self.qkv_core_width + old_aux_rows
+                if tuple(qkv.shape) == (old_rows, width):
+                    gate_key = prefix + "g_proj.weight"
+                    gate = state_dict.pop(gate_key, None)
+                    if gate is None:
+                        gate = torch.zeros(width, width, dtype=qkv.dtype, device=qkv.device)
+                    state_dict[qkv_key] = torch.cat((qkv, gate), dim=0)
         elif has_legacy_qkv:
             # Fused -> legacy layout for reference modules and checkpoint
             # inspection.  Split the same rows used in the forward path.
@@ -416,9 +444,12 @@ class BayesianMixer(nn.Module):
             aux = state_dict.pop(aux_key, None)
             if aux is not None:
                 state_dict[decay_w_key] = qkv[2 * state_width + width : 3 * state_width + width]
-                state_dict[noise_w_key] = qkv[3 * state_width + width :]
+                state_dict[noise_w_key] = qkv[3 * state_width + width : 3 * state_width + width + 2 * self.heads]
                 state_dict[decay_b_key] = aux[:state_width]
                 state_dict[noise_b_key] = aux[state_width:]
+            gate_key = prefix + "g_proj.weight"
+            if self.fuse_gate_projection and gate_key not in state_dict:
+                state_dict[gate_key] = qkv[self.qkv_core_width + self.aux_width :]
         super()._load_from_state_dict(
             state_dict, prefix, local_metadata, strict, missing_keys,
             unexpected_keys, error_msgs,
@@ -432,12 +463,17 @@ class BayesianMixer(nn.Module):
             # causal short convolution to each projected stream.
             if self.fuse_paper_qkv:
                 projected = self.qkv_proj(z)
-                if self.fuse_paper_projection and self.bayes_dynamics == "learned":
-                    qkv_core_width = 2 * self.state_width + self.width
-                    qkv_projected = projected[..., :qkv_core_width]
-                    aux_projected = projected[..., qkv_core_width:] + self.aux_bias
-                else:
-                    qkv_projected = projected
+                qkv_projected = projected[..., : self.qkv_core_width]
+                aux_projected = None
+                if self.aux_width:
+                    aux_projected = (
+                        projected[..., self.qkv_core_width : self.qkv_core_width + self.aux_width]
+                        + self.aux_bias
+                    )
+                gate_projected = (
+                    projected[..., self.qkv_core_width + self.aux_width :]
+                    if self.fuse_gate_projection else None
+                )
                 convolved = self.qkv_conv(
                     F.pad(qkv_projected.transpose(1, 2), (3, 0))
                 ).transpose(1, 2)
@@ -485,7 +521,7 @@ class BayesianMixer(nn.Module):
         q, k = (value.reshape(shape) for value in (q, k))
         v = v.reshape(b * self.heads, t, self.head_dim)
         if self.bayes_features == "paper":
-            if self.fuse_paper_projection and self.bayes_dynamics == "learned":
+            if self.aux_width:
                 aux = aux_projected
                 noise = aux[..., self.state_width :].float().view(b, t, self.heads, 2)
             else:
@@ -514,7 +550,7 @@ class BayesianMixer(nn.Module):
             else:
                 # Paper parameterization: rho=exp(-softplus(raw)), which is
                 # stable in (0, 1] and gives usable gradients for long memory.
-                if self.fuse_paper_projection:
+                if self.aux_width:
                     decay_logits = aux[..., : self.state_width].float()
                 else:
                     decay_logits = self.decay_proj(z).float()
@@ -549,7 +585,10 @@ class BayesianMixer(nn.Module):
         # state boundary so BF16 runs do not invoke a mixed-dtype fallback;
         # covariance and readout reductions above were FP32.
         read = self.read_norm(read.to(x.dtype))
-        gate = self.g_proj(z).view(b, t, self.heads, self.head_dim)
+        if self.fuse_gate_projection:
+            gate = gate_projected.view(b, t, self.heads, self.head_dim)
+        else:
+            gate = self.g_proj(z).view(b, t, self.heads, self.head_dim)
         read = (read * F.silu(gate)).reshape(b, t, self.width)
         return self.out_proj(read.to(x.dtype))
 
@@ -804,13 +843,23 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     # run pays the one-time Dynamo/Inductor compilation cost.
     if args.compile_components != "none":
         for block in model.blocks:
-            if args.compile_components in ("gqa", "both") and isinstance(block.mixer, GQAAttention):
+            if args.compile_components in ("gqa", "both", "all") and isinstance(block.mixer, GQAAttention):
                 block.mixer = torch.compile(
                     block.mixer, fullgraph=False, dynamic=False, mode="default"
                 )
-            if args.compile_components in ("swiglu", "both"):
+            if args.compile_components in ("swiglu", "both", "all"):
                 block.ffn = torch.compile(
                     block.ffn, fullgraph=False, dynamic=False, mode="default"
+                )
+            # Compile the projection/convolution/readout envelope around the
+            # custom CUDA recurrence.  The fused Bayesian autograd boundary
+            # remains a graph break, while Inductor still fuses RMSNorm,
+            # activation, reshapes, and elementwise gating on either side.
+            # This is especially useful for D=4/M=8 where the recurrence is
+            # cheaper and launch overhead becomes visible.
+            if args.compile_components in ("bayes", "all") and isinstance(block.mixer, BayesianMixer):
+                block.mixer = torch.compile(
+                    block.mixer, fullgraph=False, dynamic=False, mode="default"
                 )
     if ddp_enabled:
         model = DDP(
@@ -1058,8 +1107,8 @@ def main() -> None:
         help="use TransformerEngine's fused RMSNorm (CUDA + TransformerEngine required)",
     )
     parser.add_argument(
-        "--compile-components", choices=("none", "gqa", "swiglu", "both"), default="none",
-        help="compile selected GQA/SwiGLU modules independently",
+        "--compile-components", choices=("none", "gqa", "swiglu", "both", "bayes", "all"), default="none",
+        help="compile selected mixer/FFN modules independently (bayes compiles the projection envelope)",
     )
     parser.add_argument("--vocab-size", type=int, default=32_000)
     parser.add_argument("--width", type=int, default=512)
