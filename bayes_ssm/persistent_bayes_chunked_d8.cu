@@ -180,8 +180,15 @@ __global__ void chunk_forward_kernel(
  float* __restrict__ mean_final,float* __restrict__ cov_final,float* __restrict__ bmean,float* __restrict__ bcov,
  int n,int t,int chunks,int nb,float floor) {
  int b=blockIdx.x,tid=threadIdx.x;if(b>=n)return; extern __shared__ float sm[];
- float* mean=sm;float* cov=mean+D*M;float* cp=cov+D*D;
- float* u=FIXED ? cov+D*D : cp+D*D;float* err=u+D;float* si=err+M;
+ // Keep only the recurrent state and the innovation workspace in shared
+ // memory.  The old dynamic path materialized ``cp = A P A' + Q`` and then
+ // immediately multiplied it by k to obtain u.  No forward consumer needs
+ // cp after that product (the reverse path recomputes it), so compute u
+ // directly from the old covariance and update cov in place below.  This
+ // removes 64 shared stores/loads per token for D=8 and lowers the shared
+ // footprint enough to improve occupancy on Blackwell.
+ float* mean=sm;float* cov=mean+D*M;
+ float* u=cov+D*D;float* err=u+D;float* si=err+M;
  for(int x=tid;x<D*M;x+=THREADS) mean[x]=mean0[b*D*M+x];
  for(int x=tid;x<D*D;x+=THREADS) cov[x]=cov0[b*D*D+x]; __syncthreads();
  for(int x=tid;x<D*M;x+=THREADS) bmean[b*(nb+1)*D*M+x]=mean[x];
@@ -189,17 +196,20 @@ __global__ void chunk_forward_kernel(
  for(int ti=0;ti<t;++ti) {
    if(ti>0 && (ti%chunks)==0) {int c=ti/chunks; for(int x=tid;x<D*M;x+=THREADS)bmean[(b*(nb+1)+c)*D*M+x]=mean[x];for(int x=tid;x<D*D;x+=THREADS)bcov[(b*(nb+1)+c)*D*D+x]=cov[x];}
    const float* k=keys+(b*t+ti)*D;const float* v=values+(b*t+ti)*M;const float* q=queries+(b*t+ti)*D;const float* d=decay+(b*t+ti)*D;float pv=FIXED?0.1f:process[b*t+ti],rv=FIXED?1.0f:observation[b*t+ti];
-   if constexpr (!FIXED) {
-     for(int x=tid;x<D*D;x+=THREADS){int i=x/D,j=x%D;if(i<=j){float value=cov[i*D+j]*d[i]*d[j]+(i==j?pv:0.f);cp[i*D+j]=value;cp[j*D+i]=value;}}
-   }
-   __syncthreads();
    if constexpr (FIXED) {
      // For A=rho I and Q=qI, compute Pk without rereading the freshly
      // materialized covariance prediction.  The diagonal process term is
      // folded into the final element, preserving the same recurrence.
      for(int i=tid;i<D;i+=THREADS){float z=0;for(int j=0;j<D;++j)z+=cov[i*D+j]*k[j];u[i]=0.9409f*z+0.1f*k[i];}
    } else {
-     for(int i=tid;i<D;i+=THREADS){float z=0;for(int j=0;j<D;++j)z+=cp[i*D+j]*k[j];u[i]=z;}
+     // u = (A P A' + Q) k, without materializing the temporary covariance.
+     // Factoring d[i] outside the inner loop keeps the operation count equal
+     // to the cp+matvec sequence while avoiding a shared-memory round trip.
+     for(int i=tid;i<D;i+=THREADS){
+       float z=0.0f;
+       for(int j=0;j<D;++j) z += cov[i*D+j] * d[j] * k[j];
+       u[i] = d[i] * z + pv * k[i];
+     }
    }
    __syncthreads();
    if(tid==0){float z=rv;for(int i=0;i<D;++i)z+=k[i]*u[i];si[0]=fmaxf(z,floor);} 
@@ -221,7 +231,16 @@ __global__ void chunk_forward_kernel(
        }
      }
    } else {
-     for(int x=tid;x<D*D;x+=THREADS){int i=x/D,j=x%D;if(i<=j){float value=cp[i*D+j]-beta*u[i]*u[j];cov[i*D+j]=value;cov[j*D+i]=value;}}
+     // cp was intentionally not materialized above; update the old covariance
+     // in place now that u has been computed from it.
+     for(int x=tid;x<D*D;x+=THREADS){
+       int i=x/D,j=x%D;
+       if(i<=j){
+         float value=cov[i*D+j]*d[i]*d[j] + (i==j?pv:0.f)
+                    - beta*u[i]*u[j];
+         cov[i*D+j]=value; cov[j*D+i]=value;
+       }
+     }
    }
    __syncthreads();
    for(int c=tid;c<M;c+=THREADS){float z=0;for(int i=0;i<D;++i)z+=mean[i*M+c]*q[i];outputs[(b*t+ti)*M+c]=z;} __syncthreads();
@@ -327,7 +346,7 @@ std::vector<torch::Tensor> forward_chunked(
  TORCH_CHECK(keys.scalar_type()==at::kFloat && values.scalar_type()==at::kFloat && queries.scalar_type()==at::kFloat, "fused Bayesian inputs must be float32");
  TORCH_CHECK(keys.is_contiguous() && values.is_contiguous() && queries.is_contiguous() && decay.is_contiguous() && process.is_contiguous() && observation.is_contiguous() && mean0.is_contiguous() && cov0.is_contiguous(), "fused Bayesian inputs must be contiguous");
  TORCH_CHECK(chunks > 0 && keys.dim()==3 && values.dim()==3 && queries.dim()==3 && keys.size(2)==8 && values.size(2)==8 && queries.size(2)==8, "fused Bayesian kernel expects [N,T,8] tensors");
- int n=keys.size(0),t=keys.size(1),nb=(t+chunks-1)/chunks;auto out=torch::empty({n,t,8},keys.options()),mf=torch::empty_like(mean0),cf=torch::empty_like(cov0),bm=torch::empty({n,nb+1,8,8},keys.options()),bc=torch::empty({n,nb+1,8,8},keys.options());constexpr int th=64;size_t sh=(3*8*8+2*8+8)*sizeof(float);cudaFuncSetAttribute(chunk_forward_kernel<8,8,th>,cudaFuncAttributeMaxDynamicSharedMemorySize,(int)sh);auto st=at::cuda::getCurrentCUDAStream();chunk_forward_kernel<8,8,th><<<n,th,sh,st>>>(keys.data_ptr<float>(),values.data_ptr<float>(),queries.data_ptr<float>(),decay.data_ptr<float>(),process.data_ptr<float>(),observation.data_ptr<float>(),mean0.data_ptr<float>(),cov0.data_ptr<float>(),out.data_ptr<float>(),mf.data_ptr<float>(),cf.data_ptr<float>(),bm.data_ptr<float>(),bc.data_ptr<float>(),n,t,chunks,nb,(float)floor);C10_CUDA_KERNEL_LAUNCH_CHECK();return {out,mf,cf,bm,bc};
+ int n=keys.size(0),t=keys.size(1),nb=(t+chunks-1)/chunks;auto out=torch::empty({n,t,8},keys.options()),mf=torch::empty_like(mean0),cf=torch::empty_like(cov0),bm=torch::empty({n,nb+1,8,8},keys.options()),bc=torch::empty({n,nb+1,8,8},keys.options());constexpr int th=64;size_t sh=(2*8*8+3*8)*sizeof(float);cudaFuncSetAttribute(chunk_forward_kernel<8,8,th>,cudaFuncAttributeMaxDynamicSharedMemorySize,(int)sh);auto st=at::cuda::getCurrentCUDAStream();chunk_forward_kernel<8,8,th><<<n,th,sh,st>>>(keys.data_ptr<float>(),values.data_ptr<float>(),queries.data_ptr<float>(),decay.data_ptr<float>(),process.data_ptr<float>(),observation.data_ptr<float>(),mean0.data_ptr<float>(),cov0.data_ptr<float>(),out.data_ptr<float>(),mf.data_ptr<float>(),cf.data_ptr<float>(),bm.data_ptr<float>(),bc.data_ptr<float>(),n,t,chunks,nb,(float)floor);C10_CUDA_KERNEL_LAUNCH_CHECK();return {out,mf,cf,bm,bc};
 }
 
 std::vector<torch::Tensor> forward_chunked_fixed(
