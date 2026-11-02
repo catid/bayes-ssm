@@ -186,7 +186,10 @@ dynamic forward-plus-backward benchmark improved from 6.067 ms to 4.039 ms
 (1.50× throughput) at `N=8192, T=512, D=1, M=8`; its full parity check was
 ≤`4.8e-7` forward and ≤`3.9e-6` gradients. The D2 benchmark improved from
 25.371 ms to 22.532 ms at `N=32768, T=512, D=2, M=8` (1.13× throughput),
-with ≤`4.8e-7` forward error and ≤`3.9e-6` gradient error.
+with ≤`4.8e-7` forward error and ≤`3.9e-6` gradient error. The saved-history
+D=1 reverse kernel now processes two heads per block: its direct backward time
+is 0.644 ms versus 1.156 ms for one head per block, with ≤`4.8e-6` gradient
+error across tested partial and full blocks.
 
 The D8 kernel has also received exact SM103 optimizations: the forward
 covariance prediction and mean innovation reuse `d * k`, covariance adjoints
