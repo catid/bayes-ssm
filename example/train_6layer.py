@@ -296,13 +296,7 @@ class BayesianMixer(nn.Module):
                     )
                 self.qkv_conv = nn.Conv1d(
                     2 * self.state_width + width, 2 * self.state_width + width, kernel_size=4,
-                    # Symmetric padding followed by a prefix slice is exactly
-                    # the causal left pad for the first T outputs.  Let the
-                    # convolution handle the padding internally so we avoid a
-                    # separate full-width F.pad allocation on every Bayesian
-                    # block.  The extra right-padded outputs are discarded.
-                    padding=3, groups=2 * self.state_width + width,
-                    bias=False, dtype=factory.dtype,
+                    groups=2 * self.state_width + width, bias=False, dtype=factory.dtype,
                 )
                 nn.init.zeros_(self.qkv_conv.weight)
                 with torch.no_grad():
@@ -311,15 +305,15 @@ class BayesianMixer(nn.Module):
                 qk_width = self.state_width // 2 if bayes_dynamics == "rotation" else self.state_width
                 self.q_conv = nn.Conv1d(
                     qk_width, qk_width, kernel_size=4, groups=qk_width, bias=False,
-                    padding=3, dtype=factory.dtype,
+                    dtype=factory.dtype,
                 )
                 self.k_conv = nn.Conv1d(
                     qk_width, qk_width, kernel_size=4, groups=qk_width, bias=False,
-                    padding=3, dtype=factory.dtype,
+                    dtype=factory.dtype,
                 )
                 self.v_conv = nn.Conv1d(
                     width, width, kernel_size=4, groups=width, bias=False,
-                    padding=3, dtype=factory.dtype,
+                    dtype=factory.dtype,
                 )
                 for conv in (self.q_conv, self.k_conv, self.v_conv):
                     nn.init.zeros_(conv.weight)
@@ -547,15 +541,15 @@ class BayesianMixer(nn.Module):
                     if self.fuse_gate_projection else None
                 )
                 convolved = self.qkv_conv(
-                    qkv_projected.transpose(1, 2)
-                )[..., :t].transpose(1, 2)
+                    F.pad(qkv_projected.transpose(1, 2), (3, 0))
+                ).transpose(1, 2)
                 q_input, k_input, v_input = convolved.split(
                     (self.state_width, self.state_width, self.width), dim=-1
                 )
             else:
                 projected = (self.q_proj(z), self.k_proj(z), self.v_proj(z))
                 q_input, k_input, v_input = tuple(
-                    conv(value.transpose(1, 2))[..., :t].transpose(1, 2)
+                    conv(F.pad(value.transpose(1, 2), (3, 0))).transpose(1, 2)
                     for value, conv in zip(
                         projected, (self.q_conv, self.k_conv, self.v_conv), strict=True
                     )
