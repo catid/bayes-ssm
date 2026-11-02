@@ -149,8 +149,9 @@ At the parameter-matched `MLP=8736` Bayesian / `MLP=8400` Mamba-3 shape, a
 120-step run reached 391,105 versus 385,083 tok/s.  The Bayesian row has
 101.828M parameters versus 101.916M for Mamba-3 (0.087% fewer), with the same
 width, sequence length, batch, precision, graph, and optimizer settings.  The
-hardware-tuned `MLP=8576` result is 388,448 tok/s at 100.353M parameters.  The parameter-matched `MLP=8736`/`8400` comparison remains the conservative
-reference below. That older row's parameter count is 0.087% lower because TE
+hardware-tuned `MLP=8576` result is 388,448 tok/s at 100.353M parameters. The
+parameter-matched `MLP=8736`/`8400` comparison remains the conservative reference
+below. That row's parameter count is 0.087% lower because TE
 requires the MLP output dimension to be a multiple of 16; `--mlp-width 8736`
 is the nearest valid width to the 101.916M Mamba configuration. D=2, D=4, and
 D=8 preserve progressively more Bayesian state capacity at a throughput cost.
@@ -164,7 +165,7 @@ python example/train_6layer.py --device cuda:0 --precision te-fp8 \
   --bayes-backend fused --bayes-key-dim 1 --fuse-bayes-gate \
   --fuse-te-aux-projection --bf16-state-projection --fuse-bayes-norm-linear \
   --cuda-graph \
-  --gpu-batch-staging --chunk-length 512 --width 512 --heads 64 \
+  --gpu-batch-staging --chunk-length 64 --width 512 --heads 64 \
   --kv-heads 4 --mlp-width 8736 --seq 512 --batch 128 \
   --steps 120 --warmup 5
 ```
