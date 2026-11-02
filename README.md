@@ -209,6 +209,25 @@ remain enabled.  The experimental on-chip replay fusion is kept behind
 `BAYES_SSM_FUSED_REPLAY=1`; it is disabled by default because its larger
 shared-memory history lowers occupancy on this shape.
 
+The latest occupancy pass groups independent replay sequences within a block
+without changing the recurrence.  D1/M8 now runs four eight-lane sequences per
+block; its saved-history forward/backward microbenchmark moved from 0.448/0.651
+ms to 0.433/0.612 ms at `N=8192, T=512`.  D4/M8 runs two warp-sized sequences
+per block, reducing the direct dynamic recurrence from 2.006 ms to 1.618 ms
+at `N=128, T=512`.  D8/M8 uses two 32-lane sequences per block; its complete
+dynamic forward-plus-backward benchmark moved from 69.60 ms to 65.26 ms at
+`N=8192, T=512` (6.2%).  These grouped kernels were compared with the
+single-sequence implementations and agree to roundoff (the D8 grouped path
+was bitwise identical in the direct comparison).
+
+The reverse kernels also preserve the full covariance input gradient.  The
+`u kᵀ` contribution is intentionally kept row-wise before the transition
+scaling; mirroring it would silently remove valid derivatives for a learned
+initial covariance.  D2, D4, and D8 parity checks against the dense reference
+include this gradient and remain within approximately `1e-5` in FP32.  The
+fixed-dynamics Python reference explicitly symmetrizes its covariance state so
+its initial-state gradient follows the same graph as the fixed CUDA kernel.
+
 The paper's damped rotational variant is available with
 `--bayes-dynamics rotation`. It embeds each scalar Q/K component as
 `(component, 0)`, learns an input-dependent radius and angle for every 2-D
