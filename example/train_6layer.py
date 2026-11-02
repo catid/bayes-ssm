@@ -162,6 +162,7 @@ class BayesianMixer(nn.Module):
         fuse_paper_qkv: bool = True,
         fuse_paper_projection: bool = True,
         fuse_te_aux_projection: bool = False,
+        bf16_state_projection: bool = False,
     ) -> None:
         super().__init__()
         if width % heads:
@@ -203,6 +204,13 @@ class BayesianMixer(nn.Module):
             fuse_paper_projection and self.fuse_paper_qkv
             and (not te_active or fuse_te_aux_projection)
         )
+        # TE linears produce BF16 activations under FP8 autocast.  Keeping
+        # SiLU and per-head normalization in that dtype removes several
+        # full-width FP32 temporaries; the recurrent state boundary below
+        # still receives FP32 Q/K/V and all covariance arithmetic remains
+        # FP32.  The opt-in flag leaves exact FP32 projection math available
+        # for reference and stability comparisons.
+        self.bf16_state_projection = bool(bf16_state_projection and te_active)
         # The per-head read gate consumes the same normalized stream as the
         # Bayesian projections.  When explicitly requested, append it to the
         # fused GEMM so four small launches (Q/K/V and gate) become one.  The
@@ -509,9 +517,23 @@ class BayesianMixer(nn.Module):
         k_projected = k_input if self.bayes_features == "paper" else self.k_proj(k_input)
         v_projected = v_input if self.bayes_features == "paper" else self.v_proj(v_input)
         q_feature_dim = self.key_dim // 2 if self.bayes_dynamics == "rotation" else self.key_dim
-        q = F.silu(q_projected.float()).view(b, t, self.heads, q_feature_dim)
-        k = F.silu(k_projected.float()).view(b, t, self.heads, q_feature_dim)
-        v = F.silu(v_projected.float()).view(b, t, self.heads, self.head_dim)
+        # Keep the projection side in its native TE/BF16 dtype when the
+        # explicit fast mode is requested.  Cast only at the recurrent
+        # boundary below; the covariance state and every recurrence
+        # reduction remain FP32.  This removes the large FP32 activation
+        # temporaries otherwise created before the custom CUDA call.
+        projection_dtype = (
+            q_projected.dtype if self.bf16_state_projection else torch.float32
+        )
+        q = F.silu(q_projected.to(projection_dtype)).view(
+            b, t, self.heads, q_feature_dim
+        )
+        k = F.silu(k_projected.to(projection_dtype)).view(
+            b, t, self.heads, q_feature_dim
+        )
+        v = F.silu(v_projected.to(projection_dtype)).view(
+            b, t, self.heads, self.head_dim
+        )
         q = F.normalize(q, dim=-1)
         k = F.normalize(k, dim=-1)
         if self.bayes_dynamics == "rotation":
@@ -528,8 +550,11 @@ class BayesianMixer(nn.Module):
             k = k.permute(0, 2, 1, 3)
         v = v.permute(0, 2, 1, 3)
         shape = (b * self.heads, t, self.key_dim)
-        q, k = (value.reshape(shape) for value in (q, k))
-        v = v.reshape(b * self.heads, t, self.head_dim)
+        # The custom Bayesian API intentionally receives FP32 inputs so the
+        # innovation denominator, mean, and dense covariance have a stable
+        # CroissAttn precision boundary independent of projection dtype.
+        q, k = (value.float().reshape(shape) for value in (q, k))
+        v = v.float().reshape(b * self.heads, t, self.head_dim)
         if self.bayes_features == "paper":
             if self.aux_width:
                 aux = aux_projected
@@ -635,6 +660,7 @@ class HybridBlock(nn.Module):
         fuse_paper_qkv: bool = True,
         fuse_paper_projection: bool = True,
         fuse_te_aux_projection: bool = False,
+        bf16_state_projection: bool = False,
     ) -> None:
         super().__init__()
         self.kind = kind
@@ -647,6 +673,7 @@ class HybridBlock(nn.Module):
                 fuse_paper_qkv=fuse_paper_qkv,
                 fuse_paper_projection=fuse_paper_projection,
                 fuse_te_aux_projection=fuse_te_aux_projection,
+                bf16_state_projection=bf16_state_projection,
             )
         elif kind == "fa":
             self.mixer = GQAAttention(width, heads, kv_heads, factory)
@@ -682,6 +709,7 @@ class SixLayerLM(nn.Module):
         fuse_paper_qkv: bool = True,
         fuse_paper_projection: bool = True,
         fuse_te_aux_projection: bool = False,
+        bf16_state_projection: bool = False,
     ) -> None:
         super().__init__()
         self.vocab_size = vocab_size
@@ -698,6 +726,7 @@ class SixLayerLM(nn.Module):
                 fuse_paper_qkv=fuse_paper_qkv,
                 fuse_paper_projection=fuse_paper_projection,
                 fuse_te_aux_projection=fuse_te_aux_projection,
+                bf16_state_projection=bf16_state_projection,
             )
             for kind in self.block_kinds
         )
@@ -856,6 +885,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         fuse_paper_qkv=args.fuse_paper_qkv,
         fuse_paper_projection=args.fuse_paper_projection,
         fuse_te_aux_projection=args.fuse_te_aux_projection,
+        bf16_state_projection=args.bf16_state_projection,
     ).to(device)
     # Compile the dense attention and SwiGLU components independently.  This
     # preserves the custom Bayesian recurrence boundary while fusing the
@@ -1069,6 +1099,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         "bayes_key_dim_effective": effective_bayes_key_dim,
         "fuse_gate_projection": bool(args.fuse_gate_projection),
         "fuse_te_aux_projection": bool(args.fuse_te_aux_projection),
+        "bf16_state_projection": bool(args.bf16_state_projection),
         "bayes_features": args.bayes_features,
         "fuse_paper_qkv": bool(args.fuse_paper_qkv),
         "fuse_paper_projection": bool(args.fuse_paper_projection),
@@ -1143,6 +1174,8 @@ def main() -> None:
                         help="append the Bayesian read gate to the Q/K/V projection GEMM (experimental)")
     parser.add_argument("--fuse-te-aux-projection", dest="fuse_te_aux_projection", action="store_true",
                         help="opt into a shared TE FP8 scale for Q/K/V plus decay/noise (stability/perf tradeoff)")
+    parser.add_argument("--bf16-state-projection", action="store_true",
+                        help="run Bayesian SiLU/normalization in BF16 and cast to FP32 at the recurrent boundary")
     parser.add_argument("--seq", type=int, default=512)
     parser.add_argument("--batch", type=int, default=1)
     parser.add_argument("--steps", type=int, default=20)
