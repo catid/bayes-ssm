@@ -11,7 +11,7 @@ the hybrid model used in the repository's GB300 comparison:
 Every block has a SwiGLU feed-forward network. The token embedding and output
 head are tied. The fixed fast-path width 512 / 64 query heads / 4 KV heads /
 8448 MLP width / 32k vocabulary instantiates 100,604,448 trainable parameters
-(about 100M); the default paper-feature path is about 102.3M because it adds
+(about 100M); the default paper-feature path is about 101.94M because it adds
 learned noise, transition, and short-convolution projections. Bayesian
 covariance and all recurrent reductions are kept in FP32;
 projection and MLP linears can use BF16 or TransformerEngine FP8.
