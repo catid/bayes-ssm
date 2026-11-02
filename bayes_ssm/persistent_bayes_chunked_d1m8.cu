@@ -498,12 +498,13 @@ std::vector<torch::Tensor> backward_chunked_saved_impl(
 // register per lane and exchange only the handful of reductions through the
 // first eight warp lanes.  This preserves gradients for input-dependent
 // decay/process/observation parameters without changing the recurrence.
-__device__ __forceinline__ float d1_warp_sum8(float x) {
+__device__ __forceinline__ float d1_warp_sum8(float x, unsigned mask) {
   for (int off = 4; off > 0; off >>= 1)
-    x += __shfl_down_sync(0xffu, x, off);
+    x += __shfl_down_sync(mask, x, off, 8);
   return x;
 }
 
+template<int GROUPS>
 __global__ void backward_saved_d1_dynamic_kernel(
  const float* __restrict__ keys,const float* __restrict__ values,
  const float* __restrict__ queries,const float* __restrict__ decay,
@@ -516,8 +517,10 @@ __global__ void backward_saved_d1_dynamic_kernel(
  float* __restrict__ gdecay,float* __restrict__ gprocess,float* __restrict__ gobservation,
  float* __restrict__ gm_state,float* __restrict__ gc_state,
  int n,int t,float floor) {
-  const int b=blockIdx.x, lane=threadIdx.x;
-  if (b>=n || lane>=8) return;
+  const int group=threadIdx.x/8, lane=threadIdx.x&7;
+  const unsigned mask=0xffu << (group*8);
+  const int b=blockIdx.x*GROUPS+group;
+  if (b>=n) return;
   const size_t bo=(size_t)b*(size_t)t;
   float gm = gm_state ? gm_state[(size_t)b*8 + lane] : 0.f;
   float gc = lane==0 ? (gc_state ? gc_state[b] : 0.f) : 0.f;
@@ -531,26 +534,26 @@ __global__ void backward_saved_d1_dynamic_kernel(
     const float ppv=pp[hb];
     const float updated=mpp+beta*u*e;
     float gq_part=updated*gyt;
-    gq_part=d1_warp_sum8(gq_part);
+    gq_part=d1_warp_sum8(gq_part,mask);
     if (lane==0) gqueries[hb]=gq_part;
     gm += qval*gyt;
     const float ge=beta*gm*u;
     gvalues[hb*8+lane]=ge;
     const float gm_prev=gm-kval*ge;
     float gk_part=-mpp*ge;
-    gk_part=d1_warp_sum8(gk_part);
+    gk_part=d1_warp_sum8(gk_part,mask);
     float z=(lane==0 ? -gc*u*u : 0.f) + gm*u*e;
-    z=d1_warp_sum8(z);
+    z=d1_warp_sum8(z,mask);
     float gs=0.f;
     if (lane==0) {
       const float s=rv+kval*u;
       gs=(s>floor) ? -z*beta*beta : 0.f;
       gobservation[hb]=gs;
     }
-    gs=__shfl_sync(0xffu,gs,0);
+    gs=__shfl_sync(mask,gs,0,8);
     float a=gm*e;
-    a=d1_warp_sum8(a);
-    const float gc_bcast=__shfl_sync(0xffu,gc,0);
+    a=d1_warp_sum8(a,mask);
+    const float gc_bcast=__shfl_sync(mask,gc,0,8);
     float gu=beta*(a-2.f*gc_bcast*u)+gs*kval;
     gk_part += gs*u + ppv*gu;
     if (lane==0) {
@@ -562,7 +565,7 @@ __global__ void backward_saved_d1_dynamic_kernel(
       // token's saved replay values.
       gc=gc_prev;
     }
-    __syncwarp(0xffu);
+    __syncwarp(mask);
     float mean_prev, cov_prev;
     if (ti==0) {
       mean_prev=bmean[(size_t)b*2*8+lane];
@@ -573,7 +576,7 @@ __global__ void backward_saved_d1_dynamic_kernel(
       mean_prev=mp[hp*8+lane]+bp*up*eh[hp*8+lane];
       cov_prev=lane==0 ? pp[hp]-bp*up*up : 0.f;
     }
-    float zm=d1_warp_sum8(gm_prev*mean_prev);
+    float zm=d1_warp_sum8(gm_prev*mean_prev,mask);
     if (lane==0) {
       // gc is now dL/dP_{t-1}; the dynamic derivative through d*P*d is
       // symmetric and reduces to 2*gc*P/d for D=1.
@@ -603,7 +606,8 @@ std::vector<torch::Tensor> backward_chunked_saved_d1(
   auto gd=torch::zeros_like(decay),gp=torch::zeros_like(process),gr=torch::zeros_like(observation);
   auto gm=gmf.contiguous().clone(),gc=gcf.contiguous().clone();
   auto st=at::cuda::getCurrentCUDAStream();
-  backward_saved_d1_dynamic_kernel<<<n,8,0,st>>>(
+  constexpr int groups=2;
+  backward_saved_d1_dynamic_kernel<groups><<<(n+groups-1)/groups,groups*8,0,st>>>(
    keys.data_ptr<float>(),values.data_ptr<float>(),queries.data_ptr<float>(),decay.data_ptr<float>(),
    process.data_ptr<float>(),observation.data_ptr<float>(),bm.data_ptr<float>(),bc.data_ptr<float>(),
    mp.data_ptr<float>(),pp.data_ptr<float>(),uh.data_ptr<float>(),bh.data_ptr<float>(),eh.data_ptr<float>(),
