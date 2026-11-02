@@ -84,10 +84,10 @@ Mamba-3 mixer with `d_state=128`.
 
 | Model | Parameters | State / layout | Throughput (tok/s) | Peak allocated VRAM | Validation loss |
 |---|---:|---|---:|---:|---:|
-| Bayesian paper, D=2/M=8, grouped CUDA replay + fused causal filter | 101.928M | Bayes, Bayes, GQA, Bayes, Bayes, GQA | **796,167** | **61,547 MiB** | 10.3831 |
+| Bayesian paper, D=2/M=8, grouped CUDA replay + fused causal filter | 101.928M | Bayes, Bayes, GQA, Bayes, Bayes, GQA | **799,970** | **61,528 MiB** | 10.3838 |
 | Mamba-3 matched hybrid recheck | 101.916M | Mamba-3, Mamba-3, GQA, Mamba-3, Mamba-3, GQA | 756,009 | 63,415 MiB | 10.3664 |
 
-This is a 5.3% throughput advantage for the exact D=2 Bayesian state at this
+This is a 5.8% throughput advantage for the exact D=2 Bayesian state at this
 shape, with 3.0% less allocated VRAM. Earlier rows in this README were run
 under a different cached software state and are retained as historical records;
 do not mix them with this recheck. The compact recurrence removes the dynamic
@@ -97,10 +97,15 @@ the same `[channels, 1, 4]` checkpoint layout and was checked against cuDNN
 for short and long sequences. Disable it with `--no-fast-causal-conv` when
 running the mixer eagerly.
 
+The example runner now defaults to a 512-token replay chunk, which is the
+throughput-favorable setting for the 512-token training shape. D=2 remains
+slightly faster with either setting; wider D=4/D=8 states benefit substantially
+from avoiding eight separate replay launches per sequence.
+
 The latest record also removes an unnecessary device-to-device clone of the
 already-owned CUDA readout buffer at the custom autograd boundary. CUDA graph
 capture and the exact replay backward were smoke-tested after this change; the
-record is [here](example/results/gb300_6layer_bayes_d2_no_clone120.json). The
+record is [here](example/results/gb300_6layer_bayes_d2_default512120.json). The
 lean backward ABI now explicitly supplies zero final-state gradients, so a
 readout-only caller with detached dynamics does not fail when it selects the
 specialized CUDA reverse kernel. The same-envelope Mamba-3 rerun is
