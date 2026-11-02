@@ -390,4 +390,10 @@ std::vector<torch::Tensor> backward_chunked_lean_fixed(
  return backward_chunked_impl<false,true>(keys,values,queries,decay,process,observation,mean0,cov0,bm,bc,gy,gmf,gcf,chunks,floor);
 }
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME,m){m.def("forward_chunked",&forward_chunked);m.def("backward_chunked",&backward_chunked);m.def("backward_chunked_lean",&backward_chunked_lean);m.def("forward_chunked_fixed",&forward_chunked_fixed);m.def("backward_chunked_lean_fixed",&backward_chunked_lean_fixed);}
+
+std::vector<torch::Tensor> backward_chunked_fixed(
+ torch::Tensor keys,torch::Tensor values,torch::Tensor queries,torch::Tensor decay,torch::Tensor process,torch::Tensor observation,torch::Tensor mean0,torch::Tensor cov0,torch::Tensor bm,torch::Tensor bc,torch::Tensor gy,torch::Tensor gmf,torch::Tensor gcf,int chunks,double floor){
+ return backward_chunked_impl<true,true>(keys,values,queries,decay,process,observation,mean0,cov0,bm,bc,gy,gmf,gcf,chunks,floor);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME,m){m.def("forward_chunked",&forward_chunked);m.def("backward_chunked",&backward_chunked);m.def("backward_chunked_lean",&backward_chunked_lean);m.def("forward_chunked_fixed",&forward_chunked_fixed);m.def("backward_chunked_lean_fixed",&backward_chunked_lean_fixed);m.def("backward_chunked_fixed",&backward_chunked_fixed);}

@@ -145,8 +145,16 @@ class _ChunkedBayesianFunction(torch.autograd.Function):
                 torch.zeros(ctx.covariance_shape, device=device, dtype=keys.dtype)
                 if grad_covariance is None else grad_covariance.contiguous()
             )
-        if lean_backward and ctx.fixed_dynamics:
-            backward = extension.backward_chunked_lean_fixed
+        if ctx.fixed_dynamics:
+            # The fixed recurrence ignores the decay/noise tensors by
+            # contract.  Use the matching FIXED reverse kernel even when a
+            # caller differentiates the initial state; falling through to
+            # the dynamic reverse kernel would backpropagate through inputs
+            # that the forward pass deliberately did not read.
+            backward = (
+                extension.backward_chunked_lean_fixed
+                if lean_backward else extension.backward_chunked_fixed
+            )
         else:
             backward = (extension.backward_chunked
                         if not lean_backward
