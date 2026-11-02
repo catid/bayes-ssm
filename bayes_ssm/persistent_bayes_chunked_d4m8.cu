@@ -293,17 +293,17 @@ __global__ void backward_chunk_kernel(
      for(int x=tid;x<D*M;x+=THREADS){int i=x/M,c=x%M;gMprev[x]=gM[x]-k[i]*ge[c];}
    }
    for(int i=tid;i<D;i+=THREADS){float z=0;for(int c=0;c<M;++c)z+=mp0[i*M+c]*ge[c];gk[i]=-z;}__syncthreads();
-   float z=0;for(int x=tid;x<D*D;x+=THREADS){int i=x/D,j=x%D;float r=.5f*(gC[x]+gC[j*D+i]);z-=r*u[i]*u[j];}for(int x=tid;x<D*M;x+=THREADS){int i=x/M,c=x%M;z+=gM[x]*u[i]*e[c];}z=warp_sum_d4(z);
+   float z=0;for(int x=tid;x<D*D;x+=THREADS){int i=x/D,j=x%D;if(i<=j){float r=.5f*(gC[x]+gC[j*D+i]);z-=r*u[i]*u[j]*(i==j?1.0f:2.0f);}}for(int x=tid;x<D*M;x+=THREADS){int i=x/M,c=x%M;z+=gM[x]*u[i]*e[c];}z=warp_sum_d4(z);
    if(tid==0){float s=rv;for(int i=0;i<D;++i)s+=k[i]*u[i];scalars[0]=z;scalars[1]=(s>floor)?-z*beta*beta:0.f;
      if constexpr (NEED_DYNAMICS && !FIXED) gobservation[(size_t)b*t+ti]=scalars[1];
    }__syncwarp();float gs=scalars[1];
    for(int i=tid;i<D;i+=THREADS){float a=0,bv=0;for(int c=0;c<M;++c)a+=gM[i*M+c]*e[c];for(int j=0;j<D;++j){float r=.5f*(gC[i*D+j]+gC[j*D+i]);bv+=2.f*r*u[j];}gu[i]=beta*(a-bv)+gs*k[i];gk[i]+=gs*u[i];}__syncthreads();
-   for(int i=tid;i<D;i+=THREADS){float zz=0;for(int j=0;j<D;++j)zz+=pp0[j*D+i]*gu[j];gk[i]+=zz;}for(int x=tid;x<D*D;x+=THREADS){int i=x/D,j=x%D;float r=.5f*(gC[x]+gC[j*D+i]);
+   for(int i=tid;i<D;i+=THREADS){float zz=0;for(int j=0;j<D;++j)zz+=pp0[j*D+i]*gu[j];gk[i]+=zz;}for(int x=tid;x<D*D;x+=THREADS){int i=x/D,j=x%D;if(i<=j){float r=.5f*(gC[x]+gC[j*D+i]);
        // P is stored as a symmetric matrix.  The u=P'k contribution must
        // be projected onto that symmetric subspace as well; otherwise the
        // initial-covariance gradient acquires a spurious antisymmetric part.
        float gu_sym=0.5f*(gu[i]*k[j]+gu[j]*k[i]);
-       gCprev[x]=(r+gu_sym)*(FIXED?0.9409f:d[i]*d[j]);}__syncthreads();
+       float value=(r+gu_sym)*(FIXED?0.9409f:d[i]*d[j]);gCprev[i*D+j]=value;gCprev[j*D+i]=value;}}__syncthreads();
    const float*mean_prev;const float*cov_prev;float beta_prev=0;const float*mp_prev=nullptr;const float*uh_prev=nullptr;const float*eh_prev=nullptr;const float*pp_prev=nullptr; if(li==0){mean_prev=bmean+((size_t)b*(nb+1)+ci)*D*M;cov_prev=bcov+((size_t)b*(nb+1)+ci)*D*D;}else{size_t hp=(size_t)b*chunks+(size_t)(li-1);mp_prev=mp+hp*D*M;uh_prev=uh+hp*D;eh_prev=eh+hp*M;pp_prev=pp+hp*D*D;beta_prev=bh[hp];}
    // gMprev is produced cooperatively above; wait before the per-row decay
    // reduction reads all M columns.
