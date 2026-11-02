@@ -191,6 +191,10 @@ with ≤`4.8e-7` forward error and ≤`3.9e-6` gradient error. The saved-history
 D=1 reverse kernel now processes two heads per block: its direct backward time
 is 0.644 ms versus 1.156 ms for one head per block, with ≤`4.8e-6` gradient
 error across tested partial and full blocks.
+The D=2 forward/recompute/backward path now groups two heads per block as well;
+its direct dynamic forward-plus-backward time fell from 5.08 ms to 3.44 ms at
+`N=8192, T=512`, and the six-layer run reached 368,171 tok/s with ≤`3.8e-6`
+gradient error.
 
 The D8 kernel has also received exact SM103 optimizations: the forward
 covariance prediction and mean innovation reuse `d * k`, covariance adjoints
