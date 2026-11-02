@@ -142,8 +142,15 @@ paper mechanisms but has lower state capacity than the default D=8 row.
 | Bayesian TE FP8, optimized D=4 | 99.918M | D=4, M=8; dense 4×4 covariance/head | 323,185 tok/s | 62,492 MiB | 10.4752 |
 | Bayesian TE FP8, optimized D=8 | 101.500M | D=8, M=8; dense 8×8 covariance/head | 298,740 tok/s | 63,480 MiB | 10.4705 |
 
-The D=1 run is 4.8% slower than Mamba-3 in this current runtime, while retaining
-the full paper feature set. Its parameter count is 0.087% lower because TE
+The latest D=1 path uses saved replay history and a register-only backward kernel
+that processes two heads per CUDA block.  This keeps the full paper feature set and
+cuts the direct D=1 backward kernel from 1.156 ms to 0.644 ms at `N=8192, T=512`.
+At the hardware-friendly `MLP=8448` shape, a 120-step run reached 388,395 tok/s;
+the matched Mamba-3 launch reached 385,165 tok/s.  The Bayesian row has 99.174M
+parameters versus 102.359M for Mamba-3, so this is a throughput result at the same
+width, sequence length, batch, and optimizer settings rather than an exact parameter
+match.  The parameter-matched `MLP=8736`/`8400` comparison remains the conservative
+reference below. That older row's parameter count is 0.087% lower because TE
 requires the MLP output dimension to be a multiple of 16; `--mlp-width 8736`
 is the nearest valid width to the 101.916M Mamba configuration. D=2, D=4, and
 D=8 preserve progressively more Bayesian state capacity at a throughput cost.
@@ -164,7 +171,9 @@ python example/train_6layer.py --device cuda:0 --precision te-fp8 \
 
 The current raw records are [Bayesian D=1](example/results/gb300_6layer_bayes_d1_tefp8_current.json),
 [Bayesian D=2](example/results/gb300_6layer_bayes_d2_tefp8_current.json), and
-[Mamba-3](example/results/gb300_6layer_mamba3_tefp8_current.json).
+[Mamba-3](example/results/gb300_6layer_mamba3_tefp8_current.json). The latest
+two-head D=1 records are [Bayesian](example/results/gb300_6layer_bayes_d1_tefp8_twohead_b120.json)
+and [Mamba-3](example/results/gb300_6layer_mamba3_tefp8_8448_b120.json).
 
 Use `--bayes-backend fused` when the lower-memory custom CUDA replay path is preferred. The recorded paper-feature result uses the Inductor backend with learned input-dependent dynamics; backend rankings can change with sequence length and batch shape.
 
