@@ -296,7 +296,12 @@ __global__ void backward_chunk_kernel(
      if constexpr (NEED_DYNAMICS) gobservation[(size_t)b*t+ti]=scalars[1];
    }__syncthreads();float gs=scalars[1];
    for(int i=tid;i<D;i+=THREADS){float a=0,bv=0;for(int c=0;c<M;++c)a+=gM[i*M+c]*e[c];for(int j=0;j<D;++j){float r=.5f*(gC[i*D+j]+gC[j*D+i]);bv+=2.f*r*u[j];}gu[i]=beta*(a-bv)+gs*k[i];gk[i]+=gs*u[i];}__syncthreads();
-   for(int i=tid;i<D;i+=THREADS){float zz=0;for(int j=0;j<D;++j)zz+=pp0[j*D+i]*gu[j];gk[i]+=zz;}for(int x=tid;x<D*D;x+=THREADS){int i=x/D,j=x%D;float r=.5f*(gC[x]+gC[j*D+i]);gCprev[x]=(r+gu[i]*k[j])*(FIXED?0.9409f:d[i]*d[j]);}__syncthreads();
+   for(int i=tid;i<D;i+=THREADS){float zz=0;for(int j=0;j<D;++j)zz+=pp0[j*D+i]*gu[j];gk[i]+=zz;}for(int x=tid;x<D*D;x+=THREADS){int i=x/D,j=x%D;float r=.5f*(gC[x]+gC[j*D+i]);
+       // P is stored as a symmetric matrix.  The u=P'k contribution must
+       // be projected onto that symmetric subspace as well; otherwise the
+       // initial-covariance gradient acquires a spurious antisymmetric part.
+       float gu_sym=0.5f*(gu[i]*k[j]+gu[j]*k[i]);
+       gCprev[x]=(r+gu_sym)*(FIXED?0.9409f:d[i]*d[j]);}__syncthreads();
    const float*mean_prev;const float*cov_prev;float beta_prev=0;const float*mp_prev=nullptr;const float*uh_prev=nullptr;const float*eh_prev=nullptr;const float*pp_prev=nullptr; if(li==0){mean_prev=bmean+((size_t)b*(nb+1)+ci)*D*M;cov_prev=bcov+((size_t)b*(nb+1)+ci)*D*D;}else{size_t hp=(size_t)b*chunks+(size_t)(li-1);mp_prev=mp+hp*D*M;uh_prev=uh+hp*D;eh_prev=eh+hp*M;pp_prev=pp+hp*D*D;beta_prev=bh[hp];}
    // gMprev is produced cooperatively above; wait before the per-row decay
    // reduction reads all M columns.
