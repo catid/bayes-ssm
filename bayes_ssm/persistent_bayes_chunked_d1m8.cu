@@ -491,6 +491,128 @@ std::vector<torch::Tensor> backward_chunked_saved_impl(
  return {gk,gv,gq};
 }
 
+// D=1/M=8 dynamic replay backward.  The generic kernel above supports all
+// state dimensions and keeps its reverse state in shared memory.  For the
+// production D1 path each lane owns one value column, while covariance and
+// innovation scalars are lane zero values.  Keep the mean adjoint in a
+// register per lane and exchange only the handful of reductions through the
+// first eight warp lanes.  This preserves gradients for input-dependent
+// decay/process/observation parameters without changing the recurrence.
+__device__ __forceinline__ float d1_warp_sum8(float x) {
+  for (int off = 4; off > 0; off >>= 1)
+    x += __shfl_down_sync(0xffu, x, off);
+  return x;
+}
+
+__global__ void backward_saved_d1_dynamic_kernel(
+ const float* __restrict__ keys,const float* __restrict__ values,
+ const float* __restrict__ queries,const float* __restrict__ decay,
+ const float* __restrict__ process,const float* __restrict__ observation,
+ const float* __restrict__ bmean,const float* __restrict__ bcov,
+ const float* __restrict__ mp,const float* __restrict__ pp,
+ const float* __restrict__ uh,const float* __restrict__ bh,
+ const float* __restrict__ eh,const float* __restrict__ gy,
+ float* __restrict__ gkeys,float* __restrict__ gvalues,float* __restrict__ gqueries,
+ float* __restrict__ gdecay,float* __restrict__ gprocess,float* __restrict__ gobservation,
+ float* __restrict__ gm_state,float* __restrict__ gc_state,
+ int n,int t,float floor) {
+  const int b=blockIdx.x, lane=threadIdx.x;
+  if (b>=n || lane>=8) return;
+  const size_t bo=(size_t)b*(size_t)t;
+  float gm = gm_state ? gm_state[(size_t)b*8 + lane] : 0.f;
+  float gc = lane==0 ? (gc_state ? gc_state[b] : 0.f) : 0.f;
+  for (int ti=t-1; ti>=0; --ti) {
+    const size_t hb=bo+(size_t)ti;
+    const float kval=keys[hb], qval=queries[hb];
+    const float d=decay[hb], pv=process[hb], rv=observation[hb];
+    const float beta=bh[hb], u=uh[hb], e=eh[hb*8+lane];
+    const float gyt=gy[hb*8+lane];
+    const float mpp=mp[hb*8+lane];
+    const float ppv=pp[hb];
+    const float updated=mpp+beta*u*e;
+    float gq_part=updated*gyt;
+    gq_part=d1_warp_sum8(gq_part);
+    if (lane==0) gqueries[hb]=gq_part;
+    gm += qval*gyt;
+    const float ge=beta*gm*u;
+    gvalues[hb*8+lane]=ge;
+    const float gm_prev=gm-kval*ge;
+    float gk_part=-mpp*ge;
+    gk_part=d1_warp_sum8(gk_part);
+    float z=(lane==0 ? -gc*u*u : 0.f) + gm*u*e;
+    z=d1_warp_sum8(z);
+    float gs=0.f;
+    if (lane==0) {
+      const float s=rv+kval*u;
+      gs=(s>floor) ? -z*beta*beta : 0.f;
+      gobservation[hb]=gs;
+    }
+    gs=__shfl_sync(0xffu,gs,0);
+    float a=gm*e;
+    a=d1_warp_sum8(a);
+    const float gc_bcast=__shfl_sync(0xffu,gc,0);
+    float gu=beta*(a-2.f*gc_bcast*u)+gs*kval;
+    gk_part += gs*u + ppv*gu;
+    if (lane==0) {
+      gkeys[hb]=gk_part;
+      const float gc_prev=(gc+gu*kval)*d*d;
+      gprocess[hb]=gc_prev/(d*d);
+      // Mean/covariance immediately before this token.  For token zero use
+      // the saved chunk boundary; otherwise recover it from the previous
+      // token's saved replay values.
+      gc=gc_prev;
+    }
+    __syncwarp(0xffu);
+    float mean_prev, cov_prev;
+    if (ti==0) {
+      mean_prev=bmean[(size_t)b*2*8+lane];
+      cov_prev=lane==0 ? bcov[b*2] : 0.f;
+    } else {
+      const size_t hp=bo+(size_t)(ti-1);
+      const float bp=bh[hp], up=uh[hp];
+      mean_prev=mp[hp*8+lane]+bp*up*eh[hp*8+lane];
+      cov_prev=lane==0 ? pp[hp]-bp*up*up : 0.f;
+    }
+    float zm=d1_warp_sum8(gm_prev*mean_prev);
+    if (lane==0) {
+      // gc is now dL/dP_{t-1}; the dynamic derivative through d*P*d is
+      // symmetric and reduces to 2*gc*P/d for D=1.
+      gdecay[hb]=2.f*gc*cov_prev/d + zm;
+    }
+    gm=gm_prev*d;
+  }
+  gm_state[(size_t)b*8+lane]=gm;
+  if (lane==0) gc_state[b]=gc;
+}
+
+std::vector<torch::Tensor> backward_chunked_saved_d1(
+ torch::Tensor keys,torch::Tensor values,torch::Tensor queries,torch::Tensor decay,
+ torch::Tensor process,torch::Tensor observation,torch::Tensor mean0,torch::Tensor cov0,
+ torch::Tensor bm,torch::Tensor bc,torch::Tensor mp,torch::Tensor pp,torch::Tensor uh,
+ torch::Tensor bh,torch::Tensor eh,torch::Tensor gy,torch::Tensor gmf,torch::Tensor gcf,
+ int chunks,double floor) {
+  TORCH_CHECK(keys.is_cuda() && keys.scalar_type()==at::kFloat && keys.is_contiguous() &&
+   values.is_contiguous() && queries.is_contiguous() && decay.is_contiguous() &&
+   process.is_contiguous() && observation.is_contiguous() && bm.is_contiguous() &&
+   bc.is_contiguous() && mp.is_contiguous() && pp.is_contiguous() && uh.is_contiguous() &&
+   bh.is_contiguous() && eh.is_contiguous() && gy.is_contiguous() && gmf.is_contiguous() &&
+   gcf.is_contiguous(), "D1 saved backward inputs must be contiguous CUDA float32 tensors");
+  int n=keys.size(0),t=keys.size(1);
+  TORCH_CHECK(chunks==t, "saved D1 history requires one full-sequence chunk");
+  auto gk=torch::zeros_like(keys),gv=torch::zeros_like(values),gq=torch::zeros_like(queries);
+  auto gd=torch::zeros_like(decay),gp=torch::zeros_like(process),gr=torch::zeros_like(observation);
+  auto gm=gmf.contiguous().clone(),gc=gcf.contiguous().clone();
+  auto st=at::cuda::getCurrentCUDAStream();
+  backward_saved_d1_dynamic_kernel<<<n,8,0,st>>>(
+   keys.data_ptr<float>(),values.data_ptr<float>(),queries.data_ptr<float>(),decay.data_ptr<float>(),
+   process.data_ptr<float>(),observation.data_ptr<float>(),bm.data_ptr<float>(),bc.data_ptr<float>(),
+   mp.data_ptr<float>(),pp.data_ptr<float>(),uh.data_ptr<float>(),bh.data_ptr<float>(),eh.data_ptr<float>(),
+   gy.data_ptr<float>(),gk.data_ptr<float>(),gv.data_ptr<float>(),gq.data_ptr<float>(),gd.data_ptr<float>(),
+   gp.data_ptr<float>(),gr.data_ptr<float>(),gm.data_ptr<float>(),gc.data_ptr<float>(),n,t,(float)floor);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return {gk,gv,gq,gd,gp,gr,gm,gc};
+}
+
 std::vector<torch::Tensor> backward_chunked_saved(
  torch::Tensor keys,torch::Tensor values,torch::Tensor queries,torch::Tensor decay,
  torch::Tensor process,torch::Tensor observation,torch::Tensor mean0,torch::Tensor cov0,
@@ -532,4 +654,4 @@ std::vector<torch::Tensor> backward_chunked_fixed(
  return backward_chunked_impl<true,true>(keys,values,queries,decay,process,observation,mean0,cov0,bm,bc,gy,gmf,gcf,chunks,floor);
 }
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME,m){m.def("forward_chunked",&forward_chunked);m.def("forward_chunked_saved",&forward_chunked_saved);m.def("backward_chunked",&backward_chunked);m.def("backward_chunked_lean",&backward_chunked_lean);m.def("backward_chunked_saved",&backward_chunked_saved);m.def("backward_chunked_saved_lean",&backward_chunked_saved_lean);m.def("forward_chunked_fixed",&forward_chunked_fixed);m.def("backward_chunked_lean_fixed",&backward_chunked_lean_fixed);m.def("backward_chunked_fixed",&backward_chunked_fixed);}
+PYBIND11_MODULE(TORCH_EXTENSION_NAME,m){m.def("forward_chunked",&forward_chunked);m.def("forward_chunked_saved",&forward_chunked_saved);m.def("backward_chunked_saved_d1",&backward_chunked_saved_d1);m.def("backward_chunked",&backward_chunked);m.def("backward_chunked_lean",&backward_chunked_lean);m.def("backward_chunked_saved",&backward_chunked_saved);m.def("backward_chunked_saved_lean",&backward_chunked_saved_lean);m.def("forward_chunked_fixed",&forward_chunked_fixed);m.def("backward_chunked_lean_fixed",&backward_chunked_lean_fixed);m.def("backward_chunked_fixed",&backward_chunked_fixed);}

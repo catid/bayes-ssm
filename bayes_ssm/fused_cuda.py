@@ -186,10 +186,18 @@ class _ChunkedBayesianFunction(torch.autograd.Function):
                 if grad_covariance is None else grad_covariance.contiguous()
             )
         if ctx.use_saved_history:
-            backward = (
-                extension.backward_chunked_saved_lean
-                if lean_backward else extension.backward_chunked_saved
-            )
+            if (
+                os.environ.get("BAYES_SSM_DISABLE_D1_SPECIALIZED", "0") != "1"
+                and not lean_backward
+                and keys.shape[-1] == 1
+                and hasattr(extension, "backward_chunked_saved_d1")
+            ):
+                backward = extension.backward_chunked_saved_d1
+            else:
+                backward = (
+                    extension.backward_chunked_saved_lean
+                    if lean_backward else extension.backward_chunked_saved
+                )
         elif ctx.fixed_dynamics:
             # The fixed recurrence ignores the decay/noise tensors by
             # contract.  Use the matching FIXED reverse kernel even when a
