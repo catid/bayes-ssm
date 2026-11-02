@@ -983,6 +983,11 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         final_train_loss = _reduce_scalar(
             final_train_loss, device=device, op=dist.ReduceOp.SUM
         ) / world_size
+    effective_bayes_key_dim = args.bayes_key_dim or (args.width // args.heads)
+    value_dim = args.width // args.heads
+    fused_shape_supported = (effective_bayes_key_dim, value_dim) in {
+        (4, 8), (8, 8), (64, 64)
+    }
     result: dict[str, object] = {
         "layers": list(SixLayerLM.block_kinds),
         "parameters": parameter_count(model),
@@ -992,6 +997,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         "kv_heads": args.kv_heads,
         "mlp_width": args.mlp_width,
         "bayes_key_dim": args.bayes_key_dim,
+        "bayes_key_dim_effective": effective_bayes_key_dim,
         "bayes_features": args.bayes_features,
         "fuse_paper_qkv": bool(args.fuse_paper_qkv),
         "fuse_paper_projection": bool(args.fuse_paper_projection),
@@ -1008,10 +1014,10 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         "compile_components": args.compile_components,
         "bayesian_core": (
             "exact dense covariance; fused CUDA chunk replay"
-            if optimized and args.bayes_backend == "fused"
+            if optimized and args.bayes_backend == "fused" and fused_shape_supported
             else (
                 "exact dense covariance; Inductor diagonal-transition"
-                if optimized and args.bayes_backend == "inductor" and args.bayes_features == "paper"
+                if optimized and (args.bayes_backend == "inductor" or not fused_shape_supported) and args.bayes_features == "paper"
                 else (
                     "exact dense covariance; Inductor fallback"
                     if optimized else "exact dense covariance; eager"
