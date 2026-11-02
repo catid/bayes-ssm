@@ -12,6 +12,25 @@ __device__ __forceinline__ float warp_sum_d8(float value) {
   return value;
 }
 
+// The fixed D8 reverse kernel uses 64 lanes.  Reduce each warp with shuffle,
+// then combine the two lane-0 partials in the first warp.  This replaces the
+// six full-block shared-memory reduction barriers in the old 256-thread path
+// while preserving deterministic lane-0 ownership of the scalar results.
+template <int THREADS>
+__device__ __forceinline__ float block_sum_d8(float value, float* scratch) {
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+  value = warp_sum_d8(value);
+  if (lane == 0) scratch[warp] = value;
+  __syncthreads();
+  float total = 0.0f;
+  if (warp == 0) {
+    total = (lane < (THREADS / 32)) ? scratch[lane] : 0.0f;
+    total = warp_sum_d8(total);
+  }
+  return total;
+}
+
 template <int D, int M, int THREADS>
 __global__ void bayes_kernel(
     const float* __restrict__ keys,
@@ -353,8 +372,8 @@ __global__ void backward_chunk_kernel(
      }
      __syncwarp();
    } else {
-     red[tid]=z;__syncthreads();for(int off=THREADS/2;off>0;off>>=1){if(tid<off)red[tid]+=red[tid+off];__syncthreads();}
-     if(tid==0){float s=rv;for(int i=0;i<D;++i)s+=k[i]*u[i];scalars[0]=red[0];scalars[1]=(s>floor)?-red[0]*beta*beta:0.f;}
+     const float total = block_sum_d8<THREADS>(z, red);
+     if(tid==0){float s=rv;for(int i=0;i<D;++i)s+=k[i]*u[i];scalars[0]=total;scalars[1]=(s>floor)?-total*beta*beta:0.f;}
      __syncthreads();
    }
    float gs=scalars[1];
@@ -377,7 +396,7 @@ __global__ void backward_chunk_kernel(
      // per row removes two divisions per covariance entry from the reverse
      // pass without changing the dense-covariance gradient.
      for(int i=tid;i<D;i+=THREADS){float zd=0,zm=0;const float inv_di=1.0f/d[i];for(int j=0;j<D;++j){int pi=j<i?j:i;int pj=j<i?i:j;float cpv;if(li==0)cpv=cov_prev[i*D+j];else cpv=pp_prev[pi*D+pj]-beta_prev*uh_prev[i]*uh_prev[j];zd+=(gCprev[i*D+j]+gCprev[j*D+i])*cpv*inv_di;}for(int c=0;c<M;++c){float mv;if(li==0)mv=mean_prev[i*M+c];else mv=mp_prev[i*M+c]+beta_prev*uh_prev[i]*eh_prev[c];zm+=gMprev[i*M+c]*mv;}gdecay[((size_t)b*t+ti)*D+i]=zd+zm;}
-     float pz=0;for(int i=tid;i<D;i+=THREADS){float inv_di=1.0f/d[i];pz+=gCprev[i*D+i]*inv_di*inv_di;}if constexpr (!FIXED){pz=warp_sum_d8(pz);if(tid==0)gprocess[(size_t)b*t+ti]=pz;}else{red[tid]=pz;__syncthreads();for(int off=THREADS/2;off>0;off>>=1){if(tid<off)red[tid]+=red[tid+off];__syncthreads();}if(tid==0)gprocess[(size_t)b*t+ti]=red[0];}
+     float pz=0;for(int i=tid;i<D;i+=THREADS){float inv_di=1.0f/d[i];pz+=gCprev[i*D+i]*inv_di*inv_di;}if constexpr (!FIXED){pz=warp_sum_d8(pz);if(tid==0)gprocess[(size_t)b*t+ti]=pz;}else{const float total_p=block_sum_d8<THREADS>(pz, red);if(tid==0)gprocess[(size_t)b*t+ti]=total_p;}
    }
    if constexpr (FIXED) {
      for(int x=tid;x<D*M;x+=THREADS){int i=x/M,c=x%M;gM[x]=(gM[x]-k[i]*ge[c])*0.97f;}
