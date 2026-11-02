@@ -77,16 +77,39 @@ class _ChunkedBayesianFunction(torch.autograd.Function):
         if extension is None:
             raise RuntimeError("the fused Bayesian CUDA extension is unavailable")
         n, t, _ = keys.shape
-        forward_impl = (
-            extension.forward_chunked_fixed
-            if fixed_dynamics else extension.forward_chunked
+        # D=1 has a particularly cheap recurrent state, so retain its exact
+        # token replay values while scanning one full sequence chunk.  The
+        # reverse pass can consume these values directly and avoid launching
+        # the separate recompute kernel.  All other dimensions and partial
+        # chunks keep the boundary/recompute implementation.
+        use_saved_history = (
+            os.environ.get("BAYES_SSM_DISABLE_SAVED_HISTORY", "0") != "1"
+            and not fixed_dynamics
+            and keys.shape[-1] == 1
+            and int(chunk_length) >= int(t)
+            and hasattr(extension, "forward_chunked_saved")
         )
-        result = forward_impl(
-            keys, values, queries, decay, process, observation,
-            initial_mean, initial_covariance, int(chunk_length),
-            float(denominator_floor),
-        )
-        output, final_mean, final_covariance, boundary_mean, boundary_covariance = result
+        if use_saved_history:
+            result = extension.forward_chunked_saved(
+                keys, values, queries, decay, process, observation,
+                initial_mean, initial_covariance, int(t),
+                float(denominator_floor),
+            )
+            (output, final_mean, final_covariance, boundary_mean,
+             boundary_covariance, mp_history, pp_history, u_history,
+             beta_history, e_history) = result
+        else:
+            forward_impl = (
+                extension.forward_chunked_fixed
+                if fixed_dynamics else extension.forward_chunked
+            )
+            result = forward_impl(
+                keys, values, queries, decay, process, observation,
+                initial_mean, initial_covariance, int(chunk_length),
+                float(denominator_floor),
+            )
+            (output, final_mean, final_covariance, boundary_mean,
+             boundary_covariance) = result
         # The clones make the returned tensors independent of extension-owned
         # graph-pool storage during CUDA graph replay.  Boundary tensors remain
         # saved and are consumed by the matching reverse kernel in the same
@@ -95,11 +118,21 @@ class _ChunkedBayesianFunction(torch.autograd.Function):
         # projected [B,H,T,D] tensors are commonly reshaped views; saving the
         # original views would make the reverse kernel's flat indexing read
         # unrelated elements even though the forward result was correct.
-        ctx.save_for_backward(
-            keys, values, queries, decay, process, observation,
-            initial_mean, initial_covariance, boundary_mean, boundary_covariance,
-        )
-        ctx.chunk_length = int(chunk_length)
+        if use_saved_history:
+            ctx.save_for_backward(
+                keys, values, queries, decay, process, observation,
+                initial_mean, initial_covariance, boundary_mean,
+                boundary_covariance, mp_history, pp_history, u_history,
+                beta_history, e_history,
+            )
+        else:
+            ctx.save_for_backward(
+                keys, values, queries, decay, process, observation,
+                initial_mean, initial_covariance, boundary_mean,
+                boundary_covariance,
+            )
+        ctx.use_saved_history = use_saved_history
+        ctx.chunk_length = int(t if use_saved_history else chunk_length)
         ctx.denominator_floor = float(denominator_floor)
         ctx.fixed_dynamics = bool(fixed_dynamics)
         # The production Bayesian mixer uses fixed decay/process/observation
@@ -118,10 +151,13 @@ class _ChunkedBayesianFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output, grad_mean, grad_covariance):
+        saved = ctx.saved_tensors
         (
             keys, values, queries, decay, process, observation,
             initial_mean, initial_covariance, boundary_mean, boundary_covariance,
-        ) = ctx.saved_tensors
+        ) = saved[:10]
+        if ctx.use_saved_history:
+            _, _, _, _, _, _, _, _, _, _, mp_history, pp_history, u_history, beta_history, e_history = saved
         extension = _load_extension(keys.shape[-1])
         if extension is None:  # pragma: no cover - extension loaded in forward
             raise RuntimeError("the fused Bayesian CUDA extension is unavailable")
@@ -149,7 +185,12 @@ class _ChunkedBayesianFunction(torch.autograd.Function):
                 torch.zeros(ctx.covariance_shape, device=device, dtype=keys.dtype)
                 if grad_covariance is None else grad_covariance.contiguous()
             )
-        if ctx.fixed_dynamics:
+        if ctx.use_saved_history:
+            backward = (
+                extension.backward_chunked_saved_lean
+                if lean_backward else extension.backward_chunked_saved
+            )
+        elif ctx.fixed_dynamics:
             # The fixed recurrence ignores the decay/noise tensors by
             # contract.  Use the matching FIXED reverse kernel even when a
             # caller differentiates the initial state; falling through to
@@ -163,6 +204,29 @@ class _ChunkedBayesianFunction(torch.autograd.Function):
             backward = (extension.backward_chunked
                         if not lean_backward
                         else getattr(extension, "backward_chunked_lean", extension.backward_chunked))
+        if ctx.use_saved_history:
+            # The saved-history wrappers retain the final-state gradient
+            # arguments in their ABI so the same kernel can serve both the
+            # lean and full-dynamics cases.  Lean mode supplies zero state
+            # gradients; the kernel omits all corresponding output tensors.
+            saved_gm = (
+                torch.zeros(ctx.mean_shape, device=device, dtype=keys.dtype)
+                if grad_mean is None else grad_mean
+            )
+            saved_gc = (
+                torch.zeros(ctx.covariance_shape, device=device, dtype=keys.dtype)
+                if grad_covariance is None else grad_covariance
+            )
+            gradients = backward(
+                keys, values, queries, decay, process, observation,
+                initial_mean, initial_covariance, boundary_mean,
+                boundary_covariance, mp_history, pp_history, u_history,
+                beta_history, e_history, grad_output, saved_gm, saved_gc,
+                ctx.chunk_length, ctx.denominator_floor,
+            )
+            if lean_backward:
+                return (*gradients, None, None, None, None, None, None, None, None)
+            return (*gradients, None, None, None)
         if lean_backward:
             gradients = backward(
                 keys, values, queries, decay, process, observation,
