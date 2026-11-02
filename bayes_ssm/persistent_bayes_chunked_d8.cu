@@ -189,7 +189,7 @@ __global__ void chunk_forward_kernel(
  // removes 64 shared stores/loads per token for D=8 and lowers the shared
  // footprint enough to improve occupancy on Blackwell.
  float* mean=sm;float* cov=mean+D*M;
- float* u=cov+D*D;float* err=u+D;float* si=err+M;
+ float* u=cov+D*D;float* wk=u+D;float* err=wk+D;float* si=err+M;
  for(int x=tid;x<D*M;x+=THREADS) mean[x]=mean0[b*D*M+x];
  for(int x=tid;x<D*D;x+=THREADS) cov[x]=cov0[b*D*D+x]; __syncthreads();
  for(int x=tid;x<D*M;x+=THREADS) bmean[b*(nb+1)*D*M+x]=mean[x];
@@ -206,9 +206,13 @@ __global__ void chunk_forward_kernel(
      // u = (A P A' + Q) k, without materializing the temporary covariance.
      // Factoring d[i] outside the inner loop keeps the operation count equal
      // to the cp+matvec sequence while avoiding a shared-memory round trip.
+     // Reuse d[j] * k[j] across all covariance rows.  The direct fused
+     // matvec otherwise recomputes those eight products once per row.
+     for(int j=tid;j<D;j+=THREADS) wk[j]=d[j]*k[j];
+     __syncthreads();
      for(int i=tid;i<D;i+=THREADS){
        float z=0.0f;
-       for(int j=0;j<D;++j) z += cov[i*D+j] * d[j] * k[j];
+       for(int j=0;j<D;++j) z += cov[i*D+j] * wk[j];
        u[i] = d[i] * z + pv * k[i];
      }
    }
@@ -260,7 +264,7 @@ __global__ void recompute_chunk_kernel(
  // Write that history directly and avoid allocating a shared ``cp`` tile;
  // the reverse pass consumes pp, while the forward update can reconstruct
  // each covariance entry from the old cov and diagonal dynamics.
- float* u=cov+D*D;float* err=u+D;float* si=err+M;
+ float* u=cov+D*D;float* wk=u+D;float* err=wk+D;float* si=err+M;
  size_t bo=(size_t)b*(nb+1);for(int x=tid;x<D*M;x+=THREADS)mean[x]=bmean[bo*D*M+(size_t)ci*D*M+x];for(int x=tid;x<D*D;x+=THREADS)cov[x]=bcov[bo*D*D+(size_t)ci*D*D+x];__syncthreads();
  int start=ci*chunks,len=min(chunks,t-start);for(int li=0;li<len;++li){int ti=start+li;size_t hb=(size_t)b*(size_t)chunks+(size_t)li;const float*k=keys+((size_t)b*t+ti)*D;const float*v=values+((size_t)b*t+ti)*M;const float*d=decay+((size_t)b*t+ti)*D;float pv=FIXED?0.1f:process[(size_t)b*t+ti],rv=FIXED?1.0f:observation[(size_t)b*t+ti];
    if constexpr (!FIXED) {
@@ -273,9 +277,11 @@ __global__ void recompute_chunk_kernel(
    if constexpr (FIXED) {
      for(int i=tid;i<D;i+=THREADS){float z=0;for(int j=0;j<D;++j)z+=cov[i*D+j]*k[j];u[i]=0.9409f*z+0.1f*k[i];}
    } else {
+     for(int j=tid;j<D;j+=THREADS) wk[j]=d[j]*k[j];
+     __syncthreads();
      for(int i=tid;i<D;i+=THREADS){
        float z=0.0f;
-       for(int j=0;j<D;++j) z += cov[i*D+j]*d[j]*k[j];
+       for(int j=0;j<D;++j) z += cov[i*D+j]*wk[j];
        u[i]=d[i]*z + pv*k[i];
      }
    }
@@ -483,13 +489,13 @@ std::vector<torch::Tensor> forward_chunked(
  TORCH_CHECK(keys.scalar_type()==at::kFloat && values.scalar_type()==at::kFloat && queries.scalar_type()==at::kFloat, "fused Bayesian inputs must be float32");
  TORCH_CHECK(keys.is_contiguous() && values.is_contiguous() && queries.is_contiguous() && decay.is_contiguous() && process.is_contiguous() && observation.is_contiguous() && mean0.is_contiguous() && cov0.is_contiguous(), "fused Bayesian inputs must be contiguous");
  TORCH_CHECK(chunks > 0 && keys.dim()==3 && values.dim()==3 && queries.dim()==3 && keys.size(2)==8 && values.size(2)==8 && queries.size(2)==8, "fused Bayesian kernel expects [N,T,8] tensors");
- int n=keys.size(0),t=keys.size(1),nb=(t+chunks-1)/chunks;auto out=torch::empty({n,t,8},keys.options()),mf=torch::empty_like(mean0),cf=torch::empty_like(cov0),bm=torch::empty({n,nb+1,8,8},keys.options()),bc=torch::empty({n,nb+1,8,8},keys.options());constexpr int th=64;size_t sh=(2*8*8+3*8)*sizeof(float);cudaFuncSetAttribute(chunk_forward_kernel<8,8,th>,cudaFuncAttributeMaxDynamicSharedMemorySize,(int)sh);auto st=at::cuda::getCurrentCUDAStream();chunk_forward_kernel<8,8,th><<<n,th,sh,st>>>(keys.data_ptr<float>(),values.data_ptr<float>(),queries.data_ptr<float>(),decay.data_ptr<float>(),process.data_ptr<float>(),observation.data_ptr<float>(),mean0.data_ptr<float>(),cov0.data_ptr<float>(),out.data_ptr<float>(),mf.data_ptr<float>(),cf.data_ptr<float>(),bm.data_ptr<float>(),bc.data_ptr<float>(),n,t,chunks,nb,(float)floor);C10_CUDA_KERNEL_LAUNCH_CHECK();return {out,mf,cf,bm,bc};
+ int n=keys.size(0),t=keys.size(1),nb=(t+chunks-1)/chunks;auto out=torch::empty({n,t,8},keys.options()),mf=torch::empty_like(mean0),cf=torch::empty_like(cov0),bm=torch::empty({n,nb+1,8,8},keys.options()),bc=torch::empty({n,nb+1,8,8},keys.options());constexpr int th=32;size_t sh=(2*8*8+4*8)*sizeof(float);cudaFuncSetAttribute(chunk_forward_kernel<8,8,th>,cudaFuncAttributeMaxDynamicSharedMemorySize,(int)sh);auto st=at::cuda::getCurrentCUDAStream();chunk_forward_kernel<8,8,th><<<n,th,sh,st>>>(keys.data_ptr<float>(),values.data_ptr<float>(),queries.data_ptr<float>(),decay.data_ptr<float>(),process.data_ptr<float>(),observation.data_ptr<float>(),mean0.data_ptr<float>(),cov0.data_ptr<float>(),out.data_ptr<float>(),mf.data_ptr<float>(),cf.data_ptr<float>(),bm.data_ptr<float>(),bc.data_ptr<float>(),n,t,chunks,nb,(float)floor);C10_CUDA_KERNEL_LAUNCH_CHECK();return {out,mf,cf,bm,bc};
 }
 
 std::vector<torch::Tensor> forward_chunked_fixed(
  torch::Tensor keys,torch::Tensor values,torch::Tensor queries,torch::Tensor decay,torch::Tensor process,torch::Tensor observation,torch::Tensor mean0,torch::Tensor cov0,int chunks,double floor){
  TORCH_CHECK(keys.is_cuda() && values.is_cuda() && queries.is_cuda(), "fused Bayesian CUDA inputs must be CUDA tensors");
- int n=keys.size(0),t=keys.size(1),nb=(t+chunks-1)/chunks;auto out=torch::empty({n,t,8},keys.options()),mf=torch::empty_like(mean0),cf=torch::empty_like(cov0),bm=torch::empty({n,nb+1,8,8},keys.options()),bc=torch::empty({n,nb+1,8,8},keys.options());constexpr int th=256;size_t sh=(2*8*8+3*8)*sizeof(float);cudaFuncSetAttribute(chunk_forward_kernel<8,8,th,true>,cudaFuncAttributeMaxDynamicSharedMemorySize,(int)sh);auto st=at::cuda::getCurrentCUDAStream();chunk_forward_kernel<8,8,th,true><<<n,th,sh,st>>>(keys.data_ptr<float>(),values.data_ptr<float>(),queries.data_ptr<float>(),decay.data_ptr<float>(),process.data_ptr<float>(),observation.data_ptr<float>(),mean0.data_ptr<float>(),cov0.data_ptr<float>(),out.data_ptr<float>(),mf.data_ptr<float>(),cf.data_ptr<float>(),bm.data_ptr<float>(),bc.data_ptr<float>(),n,t,chunks,nb,(float)floor);C10_CUDA_KERNEL_LAUNCH_CHECK();return {out,mf,cf,bm,bc};
+ int n=keys.size(0),t=keys.size(1),nb=(t+chunks-1)/chunks;auto out=torch::empty({n,t,8},keys.options()),mf=torch::empty_like(mean0),cf=torch::empty_like(cov0),bm=torch::empty({n,nb+1,8,8},keys.options()),bc=torch::empty({n,nb+1,8,8},keys.options());constexpr int th=256;size_t sh=(2*8*8+4*8)*sizeof(float);cudaFuncSetAttribute(chunk_forward_kernel<8,8,th,true>,cudaFuncAttributeMaxDynamicSharedMemorySize,(int)sh);auto st=at::cuda::getCurrentCUDAStream();chunk_forward_kernel<8,8,th,true><<<n,th,sh,st>>>(keys.data_ptr<float>(),values.data_ptr<float>(),queries.data_ptr<float>(),decay.data_ptr<float>(),process.data_ptr<float>(),observation.data_ptr<float>(),mean0.data_ptr<float>(),cov0.data_ptr<float>(),out.data_ptr<float>(),mf.data_ptr<float>(),cf.data_ptr<float>(),bm.data_ptr<float>(),bc.data_ptr<float>(),n,t,chunks,nb,(float)floor);C10_CUDA_KERNEL_LAUNCH_CHECK();return {out,mf,cf,bm,bc};
 }
 
 template<bool NEED_DYNAMICS,bool FIXED=false>
@@ -545,16 +551,16 @@ std::vector<torch::Tensor> backward_chunked_impl(
  if constexpr (NEED_DYNAMICS) {
    gd_ptr=gd.data_ptr<float>(); gp_ptr=gp.data_ptr<float>(); gr_ptr=gr.data_ptr<float>();
  }
- constexpr int th=FIXED ? 256 : 64;
+ constexpr int th=FIXED ? 256 : 32;
  size_t sh=(FIXED ? 3*8*8+3*8+th : 4*8*8+3*8+th)*sizeof(float);
  // Dynamic replay no longer allocates a shared covariance-prediction tile;
  // pp is written directly to global history before the matvec.  The fixed
  // specialization has always used the smaller 2*D*D footprint as well.
- cudaFuncSetAttribute(recompute_chunk_kernel<8,8,th,FIXED>,cudaFuncAttributeMaxDynamicSharedMemorySize,(int)(2*8*8+3*8)*sizeof(float));
+ cudaFuncSetAttribute(recompute_chunk_kernel<8,8,th,FIXED>,cudaFuncAttributeMaxDynamicSharedMemorySize,(int)(2*8*8+4*8)*sizeof(float));
  cudaFuncSetAttribute(backward_chunk_kernel<8,8,th,NEED_DYNAMICS,FIXED>,cudaFuncAttributeMaxDynamicSharedMemorySize,(int)sh);
  auto st=at::cuda::getCurrentCUDAStream();
  for(int ci=nb-1;ci>=0;--ci){
-   recompute_chunk_kernel<8,8,th,FIXED><<<n,th,(2*8*8+3*8)*sizeof(float),st>>>(
+   recompute_chunk_kernel<8,8,th,FIXED><<<n,th,(2*8*8+4*8)*sizeof(float),st>>>(
      keys.data_ptr<float>(),values.data_ptr<float>(),decay.data_ptr<float>(),process.data_ptr<float>(),observation.data_ptr<float>(),
      bm.data_ptr<float>(),bc.data_ptr<float>(),mp.data_ptr<float>(),pp.data_ptr<float>(),uh.data_ptr<float>(),bh.data_ptr<float>(),eh.data_ptr<float>(),n,t,chunks,nb,ci,(float)floor);
    backward_chunk_kernel<8,8,th,NEED_DYNAMICS,FIXED><<<n,th,sh,st>>>(
