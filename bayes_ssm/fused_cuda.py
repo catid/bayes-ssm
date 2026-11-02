@@ -36,6 +36,8 @@ def _load_extension(key_dim: int):
             source = Path(__file__).with_name("persistent_bayes_chunked_d8.cu")
         elif key_dim == 4:
             source = Path(__file__).with_name("persistent_bayes_chunked_d4m8.cu")
+        elif key_dim == 2:
+            source = Path(__file__).with_name("persistent_bayes_chunked_d2m8.cu")
         else:
             return None
         _EXTENSIONS[key_dim] = load(
@@ -203,8 +205,8 @@ def fused_diagonal_bayesian(
         or keys.ndim != 3
         or values.ndim != 3
         or queries.ndim != 3
-        or keys.shape[-1] not in (4, 8, 64)
-        or (keys.shape[-1], values.shape[-1]) not in ((4, 8), (8, 8), (64, 64))
+        or keys.shape[-1] not in (2, 4, 8, 64)
+        or (keys.shape[-1], values.shape[-1]) not in ((2, 8), (4, 8), (8, 8), (64, 64))
         or queries.shape[-1] != keys.shape[-1]
         or keys.shape != queries.shape
         or values.shape[:2] != keys.shape[:2]

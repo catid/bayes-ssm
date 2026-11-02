@@ -1048,7 +1048,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     effective_bayes_key_dim = args.bayes_key_dim or (args.width // args.heads)
     value_dim = args.width // args.heads
     fused_shape_supported = (effective_bayes_key_dim, value_dim) in {
-        (4, 8), (8, 8), (64, 64)
+        (2, 8), (4, 8), (8, 8), (64, 64)
     }
     result: dict[str, object] = {
         "layers": list(SixLayerLM.block_kinds),
