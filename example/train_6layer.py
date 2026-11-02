@@ -158,6 +158,7 @@ class BayesianMixer(nn.Module):
         bayes_features: str = "paper",
         bayes_dynamics: str = "learned",
         bayes_key_dim: int | None = None,
+        fuse_gate_projection: bool = False,
         fuse_paper_qkv: bool = True,
         fuse_paper_projection: bool = True,
     ) -> None:
@@ -206,7 +207,7 @@ class BayesianMixer(nn.Module):
         # projection separate because a shared FP8 amax scale would couple the
         # gate and state-input ranges.
         self.fuse_gate_projection = bool(
-            bayes_features == "paper" and self.fuse_paper_qkv and not te_active
+            fuse_gate_projection and bayes_features == "paper" and self.fuse_paper_qkv and not te_active
         )
         self.qkv_core_width = 2 * self.state_width + width
         self.aux_width = (
@@ -627,6 +628,7 @@ class HybridBlock(nn.Module):
         bayes_features: str = "paper",
         bayes_dynamics: str = "learned",
         bayes_key_dim: int | None = None,
+        fuse_gate_projection: bool = False,
         fuse_paper_qkv: bool = True,
         fuse_paper_projection: bool = True,
     ) -> None:
@@ -637,6 +639,7 @@ class HybridBlock(nn.Module):
                 width, heads, factory, optimized=optimized, chunk_length=chunk_length,
                 bayes_features=bayes_features, bayes_dynamics=bayes_dynamics,
                 bayes_key_dim=bayes_key_dim,
+                fuse_gate_projection=fuse_gate_projection,
                 fuse_paper_qkv=fuse_paper_qkv,
                 fuse_paper_projection=fuse_paper_projection,
             )
@@ -670,6 +673,7 @@ class SixLayerLM(nn.Module):
         bayes_features: str = "paper",
         bayes_dynamics: str = "learned",
         bayes_key_dim: int | None = None,
+        fuse_gate_projection: bool = False,
         fuse_paper_qkv: bool = True,
         fuse_paper_projection: bool = True,
     ) -> None:
@@ -684,6 +688,7 @@ class SixLayerLM(nn.Module):
                 optimized=optimized, chunk_length=chunk_length,
                 bayes_features=bayes_features, bayes_dynamics=bayes_dynamics,
                 bayes_key_dim=bayes_key_dim,
+                fuse_gate_projection=fuse_gate_projection,
                 fuse_paper_qkv=fuse_paper_qkv,
                 fuse_paper_projection=fuse_paper_projection,
             )
@@ -840,6 +845,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         factory=factory, optimized=optimized, chunk_length=args.chunk_length,
         bayes_features=args.bayes_features, bayes_dynamics=args.bayes_dynamics,
         bayes_key_dim=args.bayes_key_dim,
+        fuse_gate_projection=args.fuse_gate_projection,
         fuse_paper_qkv=args.fuse_paper_qkv,
         fuse_paper_projection=args.fuse_paper_projection,
     ).to(device)
@@ -1053,6 +1059,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         "mlp_width": args.mlp_width,
         "bayes_key_dim": args.bayes_key_dim,
         "bayes_key_dim_effective": effective_bayes_key_dim,
+        "fuse_gate_projection": bool(args.fuse_gate_projection),
         "bayes_features": args.bayes_features,
         "fuse_paper_qkv": bool(args.fuse_paper_qkv),
         "fuse_paper_projection": bool(args.fuse_paper_projection),
@@ -1123,6 +1130,8 @@ def main() -> None:
     parser.add_argument("--mlp-width", type=int, default=8448)
     parser.add_argument("--bayes-key-dim", type=int, default=None,
                         help="per-head Bayesian key/state dimension (default: head width; e.g. 4 with value width 8)")
+    parser.add_argument("--fuse-bayes-gate", dest="fuse_gate_projection", action="store_true",
+                        help="append the Bayesian read gate to the Q/K/V projection GEMM (experimental)")
     parser.add_argument("--seq", type=int, default=512)
     parser.add_argument("--batch", type=int, default=1)
     parser.add_argument("--steps", type=int, default=20)
