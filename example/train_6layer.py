@@ -939,14 +939,15 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     # projection/activation backward graphs.  It is optional because the first
     # run pays the one-time Dynamo/Inductor compilation cost.
     if args.compile_components != "none":
+        compile_mode = os.environ.get("BAYES_SSM_COMPILE_MODE", "default")
         for block in model.blocks:
             if args.compile_components in ("gqa", "both", "all") and isinstance(block.mixer, GQAAttention):
                 block.mixer = torch.compile(
-                    block.mixer, fullgraph=False, dynamic=False, mode="default"
+                    block.mixer, fullgraph=False, dynamic=False, mode=compile_mode
                 )
             if args.compile_components in ("swiglu", "both", "all"):
                 block.ffn = torch.compile(
-                    block.ffn, fullgraph=False, dynamic=False, mode="default"
+                    block.ffn, fullgraph=False, dynamic=False, mode=compile_mode
                 )
             # Compile the projection/convolution/readout envelope around the
             # custom CUDA recurrence.  The fused Bayesian autograd boundary
@@ -956,7 +957,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             # cheaper and launch overhead becomes visible.
             if args.compile_components in ("bayes", "all") and isinstance(block.mixer, BayesianMixer):
                 block.mixer = torch.compile(
-                    block.mixer, fullgraph=False, dynamic=False, mode="default"
+                    block.mixer, fullgraph=False, dynamic=False, mode=compile_mode
                 )
     if ddp_enabled:
         model = DDP(
