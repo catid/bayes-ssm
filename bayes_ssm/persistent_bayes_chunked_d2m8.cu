@@ -376,7 +376,8 @@ std::vector<torch::Tensor> backward_chunked_impl(
  // full warp only repeats barriers and reductions for this narrow state.
  constexpr int th=16;
  constexpr size_t recompute_sh=(2*8+2*4+2*2+2*8)*sizeof(float);
- constexpr size_t backward_sh=((FIXED ? 8 : 16) + 2*4 + 8 + 3*2 + th)*sizeof(float);
+ // gM/gMprev are both present for dynamic replay; fixed replay aliases them.
+ constexpr size_t backward_sh=((FIXED ? 16 : 2*16) + 2*4 + 8 + 3*2 + th)*sizeof(float);
  cudaFuncSetAttribute(recompute_chunk_kernel<2,8,th,FIXED>,cudaFuncAttributeMaxDynamicSharedMemorySize,(int)recompute_sh);
  cudaFuncSetAttribute(backward_chunk_kernel<2,8,th,NEED_DYNAMICS,FIXED>,cudaFuncAttributeMaxDynamicSharedMemorySize,(int)backward_sh);
  auto st=at::cuda::getCurrentCUDAStream();
