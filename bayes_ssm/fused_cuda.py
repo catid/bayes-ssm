@@ -155,6 +155,14 @@ class _ChunkedBayesianFunction(torch.autograd.Function):
         ctx.output_shape = tuple(output.shape)
         ctx.mean_shape = tuple(final_mean.shape)
         ctx.covariance_shape = tuple(final_covariance.shape)
+        # The model consumes only the token readout.  Without this setting
+        # autograd materializes zero tensors for unused final-state outputs,
+        # making ``lean_backward`` indistinguishable from a caller that really
+        # differentiates the returned mean/covariance.  Keeping unused output
+        # gradients as ``None`` lets the exact lean reverse kernels skip all
+        # state/dynamics-gradient work while preserving full gradients when a
+        # caller uses either final state.
+        ctx.set_materialize_grads(False)
         return output.clone(), final_mean.clone(), final_covariance.clone()
 
     @staticmethod
@@ -245,7 +253,7 @@ class _ChunkedBayesianFunction(torch.autograd.Function):
                 # scalar metadata arguments.  Lean mode returns gradients
                 # only for keys/values/queries; the other five tensor inputs
                 # and three metadata values still need exactly eight slots.
-                return (*gradients, None, None, None, None, None, None, None)
+                return (*gradients, None, None, None, None, None, None, None, None)
             return (*gradients, None, None, None)
         if lean_backward:
             gradients = backward(
@@ -255,7 +263,7 @@ class _ChunkedBayesianFunction(torch.autograd.Function):
             )
             # Three tensor gradients plus five tensor and three scalar
             # non-differentiable inputs = eleven backward slots.
-            return (*gradients, None, None, None, None, None, None, None)
+            return (*gradients, None, None, None, None, None, None, None, None)
         gradients = backward(
             keys, values, queries, decay, process, observation,
             initial_mean, initial_covariance, boundary_mean, boundary_covariance,
