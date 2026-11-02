@@ -983,6 +983,13 @@ def bayesian_layer(
         raise ValueError("chunk_length must be a positive integer or None")
     if t == 0:
         return torch.empty(*batch_shape, 0, m, device=device, dtype=dtype), mean, covariance
+    # The optimized diagonal/compiled paths target the production boundary
+    # with constant initial state.  Preserve exact gradients for callers that
+    # learn the initial mean or covariance by using the dense reference path;
+    # this also keeps arbitrary (possibly asymmetric) covariance parameters
+    # from being treated as a symmetric storage format.
+    if optimized and (mean.requires_grad or covariance.requires_grad):
+        optimized = False
     # The replay autograd boundary saves its dense transition/process inputs.
     # Materialize the exact representation in that opt-in mode so gradients
     # through diagonal dynamics and process noise are not dropped.
