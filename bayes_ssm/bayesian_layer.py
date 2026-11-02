@@ -300,8 +300,8 @@ def _core_loop_rotation(
             (c.unsqueeze(-2) * col0 - s.unsqueeze(-2) * col1,
              s.unsqueeze(-2) * col0 + c.unsqueeze(-2) * col1), dim=-1
         ).reshape_as(covariance)
-        process_diag = torch.zeros(
-            *covariance.shape[:-2], d, device=covariance.device, dtype=covariance.dtype
+        process_diag = torch.zeros_like(
+            torch.diagonal(predicted_covariance, dim1=-2, dim2=-1)
         )
         process_diag[..., 0::2] = process_variances[..., i, :]
         predicted_covariance = torch.diagonal_scatter(
@@ -1038,8 +1038,7 @@ def bayesian_layer(
         if (
             device.type == "cuda"
             and len(batch_shape) == 1
-            and d == 64
-            and m == 64
+            and ((d == 64 and m == 64) or (d == 8 and m == 8))
             and diagonal_transition is not None
             and process_covariances is None
         ):
