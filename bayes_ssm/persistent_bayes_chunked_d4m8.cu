@@ -100,7 +100,9 @@ __global__ void bayes_kernel(
       int i = x / M, c = x - i * M;
       mean[x] = d[i] * mean[x] + beta * tmp[i] * si[c];
     }
-    sync_threads_d4<THREADS>();
+    // The covariance update does not read `mean`.  Its following warp
+    // barrier also makes these writes visible before the readout, so an
+    // otherwise redundant barrier can be skipped here (one barrier/token).
     for (int x = tid; x < D * D; x += THREADS) {
       int i = x / D, j = x - i * D;
       float updated = cov_pred[x] - beta * tmp[i] * tmp[j];
@@ -120,7 +122,9 @@ __global__ void bayes_kernel(
       for (int i = 0; i < D; ++i) z += mean[i * M + c] * q[i];
       out[c] = z;
     }
-    sync_threads_d4<THREADS>();
+    // Output stores are independent of the next token's recurrence.  The
+    // next iteration overwrites only its own scratch and reads mean/cov after
+    // the covariance barrier above; no barrier is needed after this write.
   }
   for (int x = tid; x < D * M; x += THREADS) mean_out[b * D * M + x] = mean[x];
   for (int x = tid; x < D * D; x += THREADS) cov_out[b * D * D + x] = cov[x];
@@ -218,7 +222,6 @@ __global__ void chunk_forward_kernel(
    if(tid==0){float z=rv;for(int i=0;i<D;++i)z+=k[i]*u[i];si[0]=fmaxf(z,floor);} 
    for(int c=tid;c<M;c+=THREADS){float z=0;for(int i=0;i<D;++i)z+=(FIXED?0.97f:d[i])*mean[i*M+c]*k[i];err[c]=v[c]-z;} sync_threads_d4<THREADS>();float beta=1.f/si[0];
    for(int x=tid;x<D*M;x+=THREADS){int i=x/M,c=x%M;mean[x]=(FIXED?0.97f:d[i])*mean[x]+beta*u[i]*err[c];}
-   sync_threads_d4<THREADS>();
    if constexpr (FIXED) {
      // The fixed recurrence preserves symmetry. Compute each upper-triangle
      // entry once and mirror it, halving the covariance update arithmetic.
@@ -233,7 +236,7 @@ __global__ void chunk_forward_kernel(
      for(int x=tid;x<D*D;x+=THREADS){int i=x/D,j=x%D;if(i<=j){float value=cov[i*D+j]*d[i]*d[j]+(i==j?pv:0.f)-beta*u[i]*u[j];cov[i*D+j]=value;cov[j*D+i]=value;}}
    }
    sync_threads_d4<THREADS>();
-   for(int c=tid;c<M;c+=THREADS){float z=0;for(int i=0;i<D;++i)z+=mean[i*M+c]*q[i];outputs[(b*t+ti)*M+c]=z;} sync_threads_d4<THREADS>();
+   for(int c=tid;c<M;c+=THREADS){float z=0;for(int i=0;i<D;++i)z+=mean[i*M+c]*q[i];outputs[(b*t+ti)*M+c]=z;}
  }
  for(int x=tid;x<D*M;x+=THREADS)mean_final[b*D*M+x]=mean[x];for(int x=tid;x<D*D;x+=THREADS)cov_final[b*D*D+x]=cov[x];
  for(int x=tid;x<D*M;x+=THREADS)bmean[(b*(nb+1)+nb)*D*M+x]=mean[x];for(int x=tid;x<D*D;x+=THREADS)bcov[(b*(nb+1)+nb)*D*D+x]=cov[x];
