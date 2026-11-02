@@ -398,7 +398,7 @@ std::vector<torch::Tensor> forward_chunked_saved(
  // D1/M8 uses one eight-lane group per sequence.  Four groups fit in a
  // 32-thread warp-sized block and improve residency for the scalar recurrence
  // without changing any arithmetic or synchronization masks.
- constexpr int th=8; constexpr int groups=4;
+ constexpr int th=8; constexpr int groups=2;
  constexpr size_t sh=groups*(8+1+1+1+8+1)*sizeof(float);
  cudaFuncSetAttribute(chunk_forward_kernel<1,8,th,false,groups>,cudaFuncAttributeMaxDynamicSharedMemorySize,(int)sh);
  auto st=at::cuda::getCurrentCUDAStream();
@@ -617,7 +617,7 @@ std::vector<torch::Tensor> backward_chunked_saved_d1(
   // Keep four independent eight-lane sequences resident in each block.  The
   // masked shuffles make groups independent, so this is an occupancy-only
   // change with identical forward and reverse arithmetic.
-  constexpr int groups=4;
+  constexpr int groups=2;
   backward_saved_d1_dynamic_kernel<groups><<<(n+groups-1)/groups,groups*8,0,st>>>(
    keys.data_ptr<float>(),values.data_ptr<float>(),queries.data_ptr<float>(),decay.data_ptr<float>(),
    process.data_ptr<float>(),observation.data_ptr<float>(),bm.data_ptr<float>(),bc.data_ptr<float>(),
