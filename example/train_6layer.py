@@ -155,6 +155,8 @@ class BayesianMixer(nn.Module):
         *,
         optimized: bool,
         chunk_length: int,
+        bayes_features: str = "paper",
+        bayes_dynamics: str = "learned",
     ) -> None:
         super().__init__()
         if width % heads:
@@ -162,7 +164,64 @@ class BayesianMixer(nn.Module):
         self.width, self.heads, self.head_dim = width, heads, width // heads
         self.optimized = optimized
         self.chunk_length = chunk_length
+        if bayes_features not in {"fixed", "paper"}:
+            raise ValueError("bayes_features must be 'fixed' or 'paper'")
+        if bayes_dynamics not in {"learned", "identity"}:
+            raise ValueError("bayes_dynamics must be 'learned' or 'identity'")
+        self.bayes_features = bayes_features
+        self.bayes_dynamics = bayes_dynamics
         self.norm = factory.rms_norm(width)
+        if bayes_features == "paper":
+            # Memory by Design's language/MQAR path uses three independent
+            # depthwise causal length-4 convolutions after Q/K/V projection.
+            # We warm-start each as the identity map so enabling this path
+            # does not destroy the stable fixed-path initialization, then let
+            # training learn the short context filter.
+            self.q_conv = nn.Conv1d(
+                width, width, kernel_size=4, groups=width, bias=False,
+                dtype=factory.dtype,
+            )
+            self.k_conv = nn.Conv1d(
+                width, width, kernel_size=4, groups=width, bias=False,
+                dtype=factory.dtype,
+            )
+            self.v_conv = nn.Conv1d(
+                width, width, kernel_size=4, groups=width, bias=False,
+                dtype=factory.dtype,
+            )
+            for conv in (self.q_conv, self.k_conv, self.v_conv):
+                nn.init.zeros_(conv.weight)
+                with torch.no_grad():
+                    conv.weight[:, 0, -1] = 1
+            # The paper parameterizes positive input-dependent process and
+            # observation variances with softplus. Per-head scalars preserve
+            # the exact dense covariance while avoiding a large extra head-D
+            # projection. Zero weights plus calibrated biases start at the
+            # fixed path's Q=.1 and R=1 values.
+            self.noise_proj = factory.linear(width, 2 * heads, bias=True)
+            nn.init.zeros_(self.noise_proj.weight)
+            nn.init.zeros_(self.noise_proj.bias)
+            # Output layout is interleaved [process_h0, observation_h0,
+            # process_h1, observation_h1, ...].  Contiguous halves would
+            # initialize half the heads with the wrong observation variance.
+            self.noise_proj.bias.data[0::2].fill_(math.log(math.expm1(0.1)))
+            self.noise_proj.bias.data[1::2].fill_(math.log(math.expm1(1.0)))
+            if bayes_dynamics == "learned":
+                # A learned diagonal transition is input-dependent. Initialize
+                # per-coordinate half-lives over the paper's 32..4096-token
+                # range, then let the input projection modulate them.
+                self.decay_proj = factory.linear(width, width, bias=True)
+                nn.init.zeros_(self.decay_proj.weight)
+                half_lives = torch.logspace(
+                    math.log10(32.0), math.log10(4096.0), width,
+                    device=self.decay_proj.bias.device, dtype=torch.float32,
+                )
+                # rho=exp(-softplus(raw)); inverse-softplus(-log(rho))
+                # initializes the transition exactly at each half-life.
+                raw = torch.log(torch.expm1(math.log(2.0) / half_lives))
+                self.decay_proj.bias.data.copy_(raw.to(self.decay_proj.bias.dtype))
+            else:
+                self.decay_proj = None
         self.q_proj = factory.linear(width, width)
         self.k_proj = factory.linear(width, width)
         self.v_proj = factory.linear(width, width)
@@ -184,34 +243,65 @@ class BayesianMixer(nn.Module):
     def forward(self, x: Tensor) -> Tensor:
         b, t, _ = x.shape
         z = self.norm(x)
+        if self.bayes_features == "paper":
+            # The paper projects first and applies an independent depthwise
+            # causal short convolution to each projected stream.
+            projected = (self.q_proj(z), self.k_proj(z), self.v_proj(z))
+            q_input, k_input, v_input = tuple(
+                conv(F.pad(value.transpose(1, 2), (3, 0))).transpose(1, 2)
+                for value, conv in zip(
+                    projected, (self.q_conv, self.k_conv, self.v_conv), strict=True
+                )
+            )
+        else:
+            q_input = k_input = v_input = z
         # Normalize each head before entering the FP32 state boundary.  The
         # normalization must happen after splitting the projection into heads:
         # normalizing the flattened width would shrink every head's key norm
         # by roughly sqrt(num_heads), weakening the Kalman update by that
         # factor while leaving observation variance unchanged.
-        q = F.silu(self.q_proj(z).float()).view(
-            b, t, self.heads, self.head_dim
-        )
-        k = F.silu(self.k_proj(z).float()).view(
-            b, t, self.heads, self.head_dim
-        )
-        v = F.silu(self.v_proj(z).float()).view(
-            b, t, self.heads, self.head_dim
-        )
+        q_projected = q_input if self.bayes_features == "paper" else self.q_proj(q_input)
+        k_projected = k_input if self.bayes_features == "paper" else self.k_proj(k_input)
+        v_projected = v_input if self.bayes_features == "paper" else self.v_proj(v_input)
+        q = F.silu(q_projected.float()).view(b, t, self.heads, self.head_dim)
+        k = F.silu(k_projected.float()).view(b, t, self.heads, self.head_dim)
+        v = F.silu(v_projected.float()).view(b, t, self.heads, self.head_dim)
         q = F.normalize(q, dim=-1).permute(0, 2, 1, 3)
         k = F.normalize(k, dim=-1).permute(0, 2, 1, 3)
         v = v.permute(0, 2, 1, 3)
         shape = (b * self.heads, t, self.head_dim)
         q, k, v = (value.reshape(shape) for value in (q, k, v))
-        decay = self.decay.expand(b * self.heads, t, self.head_dim)
+        if self.bayes_features == "paper":
+            noise = self.noise_proj(z).float().view(b, t, self.heads, 2)
+            process = F.softplus(noise[..., 0]) + 1e-4
+            observation = F.softplus(noise[..., 1]) + 1e-4
+            process = process.permute(0, 2, 1).reshape(b * self.heads, t)
+            observation = observation.permute(0, 2, 1).reshape(b * self.heads, t)
+            if self.decay_proj is None:
+                decay = torch.ones(
+                    b * self.heads, t, self.head_dim,
+                    device=z.device, dtype=torch.float32,
+                )
+            else:
+                # Paper parameterization: rho=exp(-softplus(raw)), which is
+                # stable in (0, 1] and gives usable gradients for long memory.
+                decay = torch.exp(-F.softplus(self.decay_proj(z).float()))
+                decay = decay.view(b, t, self.heads, self.head_dim)
+                decay = decay.permute(0, 2, 1, 3).reshape(
+                    b * self.heads, t, self.head_dim
+                )
+        else:
+            decay = self.decay.expand(b * self.heads, t, self.head_dim)
+            process = self.process_variance
+            observation = self.observation_variance
         read, _, _ = bayesian_layer(
             k, v, q,
             transition_diagonals=decay,
-            process_variances=self.process_variance,
-            observation_variances=self.observation_variance,
+            process_variances=process,
+            observation_variances=observation,
             chunk_length=self.chunk_length,
             optimized=self.optimized,
-            fixed_dynamics=True,
+            fixed_dynamics=self.bayes_features == "fixed",
         )
         read = read.view(b, self.heads, t, self.head_dim).permute(0, 2, 1, 3)
         # RMSNorm's parameter dtype follows the projection path. Cast at the
@@ -248,12 +338,15 @@ class HybridBlock(nn.Module):
         *,
         optimized: bool,
         chunk_length: int,
+        bayes_features: str = "paper",
+        bayes_dynamics: str = "learned",
     ) -> None:
         super().__init__()
         self.kind = kind
         if kind == "bayesian":
             self.mixer = BayesianMixer(
                 width, heads, factory, optimized=optimized, chunk_length=chunk_length,
+                bayes_features=bayes_features, bayes_dynamics=bayes_dynamics,
             )
         elif kind == "fa":
             self.mixer = GQAAttention(width, heads, kv_heads, factory)
@@ -282,6 +375,8 @@ class SixLayerLM(nn.Module):
         factory: LinearFactory,
         optimized: bool = False,
         chunk_length: int = 64,
+        bayes_features: str = "paper",
+        bayes_dynamics: str = "learned",
     ) -> None:
         super().__init__()
         self.vocab_size = vocab_size
@@ -292,6 +387,7 @@ class SixLayerLM(nn.Module):
             HybridBlock(
                 kind, width, heads, kv_heads, mlp_width, factory,
                 optimized=optimized, chunk_length=chunk_length,
+                bayes_features=bayes_features, bayes_dynamics=bayes_dynamics,
             )
             for kind in self.block_kinds
         )
@@ -310,21 +406,41 @@ def parameter_count(model: nn.Module) -> int:
     return sum(parameter.numel() for parameter in model.parameters())
 
 
-def _read_tokens(path: Path) -> Tensor:
+def _read_tokens(path: Path, *, token_dtype: str = "auto") -> Tensor:
+    """Read NumPy token arrays or headerless uint16/int64 token streams.
+
+    The paper repository's ``.npy``-named shards are headerless uint16 files,
+    while ordinary NumPy arrays carry the ``.npy`` magic header.  Detect that
+    distinction instead of interpreting a uint16 shard as int64 and silently
+    reducing its apparent length by 4x.
+    """
     try:
-        import numpy as np
-        values = np.load(path, mmap_mode="r", allow_pickle=False)
-        values = values.reshape(-1)
-        return torch.from_numpy(values.astype("int64", copy=True))
-    except (ImportError, ValueError, OSError):
-        # Also accept a flat uint16/int64 binary token file.
-        return torch.from_file(str(path), dtype=torch.int64)
+        with path.open("rb") as stream:
+            has_numpy_header = stream.read(6) == b"\x93NUMPY"
+    except OSError:
+        has_numpy_header = False
+    if has_numpy_header:
+        try:
+            import numpy as np
+            values = np.load(path, mmap_mode="r", allow_pickle=False).reshape(-1)
+            return torch.from_numpy(values.astype("int64", copy=True))
+        except (ImportError, ValueError, OSError) as exc:
+            raise ValueError(f"unable to read NumPy token array {path}") from exc
+    if token_dtype == "auto":
+        token_dtype = "uint16"
+    raw_dtype = {"uint16": torch.uint16, "int64": torch.int64}.get(token_dtype)
+    if raw_dtype is None:
+        raise ValueError(f"unsupported token dtype {token_dtype!r}")
+    element_size = torch.empty((), dtype=raw_dtype).element_size()
+    size = path.stat().st_size // element_size
+    return torch.from_file(str(path), dtype=raw_dtype, size=size).to(torch.int64)
 
 
 def _make_data(args: argparse.Namespace, *, seed: int) -> tuple[Tensor, Tensor]:
     if args.tokens is not None:
-        train = _read_tokens(args.tokens)
-        valid = _read_tokens(args.valid_tokens) if args.valid_tokens else train
+        train = _read_tokens(args.tokens, token_dtype=args.token_dtype)
+        valid = (_read_tokens(args.valid_tokens, token_dtype=args.token_dtype)
+                 if args.valid_tokens else train)
         if train.numel() < args.seq + 1 or valid.numel() < args.seq + 1:
             raise ValueError("token files must contain at least seq+1 tokens")
         return train, valid
@@ -424,6 +540,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     model = SixLayerLM(
         args.vocab_size, args.width, args.heads, args.kv_heads, args.mlp_width,
         factory=factory, optimized=optimized, chunk_length=args.chunk_length,
+        bayes_features=args.bayes_features, bayes_dynamics=args.bayes_dynamics,
     ).to(device)
     # Compile the dense attention and SwiGLU components independently.  This
     # preserves the custom Bayesian recurrence boundary while fusing the
@@ -618,6 +735,10 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         "heads": args.heads,
         "kv_heads": args.kv_heads,
         "mlp_width": args.mlp_width,
+        "bayes_features": args.bayes_features,
+        "bayes_dynamics": (
+            args.bayes_dynamics if args.bayes_features == "paper" else "fixed-constant"
+        ),
         "vocab_size": args.vocab_size,
         "sequence_length": args.seq,
         "batch": args.batch,
@@ -627,9 +748,13 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         "fused_rmsnorm": bool(args.fused_rmsnorm),
         "compile_components": args.compile_components,
         "bayesian_core": (
-            "exact dense covariance; fused CUDA chunk replay"
-            if optimized and os.environ.get("BAYES_SSM_DISABLE_FUSED_CUDA", "0") != "1"
-            else ("exact dense covariance; Inductor fallback" if optimized else "exact dense covariance; eager")
+            "exact dense covariance; Inductor diagonal-transition"
+            if optimized and args.bayes_features == "paper"
+            else (
+                "exact dense covariance; fused CUDA chunk replay"
+                if optimized and os.environ.get("BAYES_SSM_DISABLE_FUSED_CUDA", "0") != "1"
+                else ("exact dense covariance; Inductor fallback" if optimized else "exact dense covariance; eager")
+            )
         ),
         "bayes_backend_requested": args.bayes_backend,
         "chunk_length": args.chunk_length,
@@ -681,6 +806,14 @@ def main() -> None:
     parser.add_argument("--weight-decay", type=float, default=0.1)
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--chunk-length", type=int, default=64)
+    parser.add_argument(
+        "--bayes-features", choices=("fixed", "paper"), default="paper",
+        help="Bayesian mixer features (default: paper; fixed is the old fast benchmark path)",
+    )
+    parser.add_argument(
+        "--bayes-dynamics", choices=("learned", "identity"), default="learned",
+        help="paper mode dynamics: input-dependent learned diagonal decay or identity",
+    )
     parser.add_argument("--optimize-bayes", action="store_true",
                         help="use the compiled exact Bayesian core on CUDA")
     parser.add_argument("--bayes-backend", choices=("auto", "fused", "inductor"), default="auto",
@@ -692,8 +825,10 @@ def main() -> None:
     parser.add_argument("--ddp-bucket-cap-mb", type=float, default=25.0,
                         help="DDP gradient bucket size in MiB (torchrun only)")
     parser.add_argument("--tokens", type=Path,
-                        help="optional .npy or flat int64 token file; otherwise synthetic data is used")
+                        help="optional NumPy or headerless token file; otherwise synthetic data is used")
     parser.add_argument("--valid-tokens", type=Path)
+    parser.add_argument("--token-dtype", choices=("auto", "uint16", "int64"), default="auto",
+                        help="dtype for headerless token files (auto defaults to uint16)")
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--output", type=Path,
                         help="optional JSON output path")
