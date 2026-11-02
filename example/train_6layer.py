@@ -92,6 +92,17 @@ class LinearFactory:
             )
         return nn.Linear(in_features, out_features, bias=bias, dtype=self.dtype)
 
+    def layernorm_linear(
+        self, in_features: int, out_features: int, *, bias: bool = False,
+    ) -> nn.Module | None:
+        """Create TE's fused RMSNorm+Linear module when available."""
+        if self.te is None:
+            return None
+        return self.te.LayerNormLinear(
+            in_features, out_features, normalization="RMSNorm", bias=bias,
+            params_dtype=torch.bfloat16,
+        )
+
     def rms_norm(self, hidden_size: int) -> nn.Module:
         if self._rms_te is not None:
             return self._rms_te.RMSNorm(hidden_size, dtype=self.dtype)
@@ -163,6 +174,7 @@ class BayesianMixer(nn.Module):
         fuse_paper_projection: bool = True,
         fuse_te_aux_projection: bool = False,
         bf16_state_projection: bool = False,
+        fuse_bayes_norm_linear: bool = False,
     ) -> None:
         super().__init__()
         if width % heads:
@@ -220,6 +232,15 @@ class BayesianMixer(nn.Module):
         self.fuse_gate_projection = bool(
             fuse_gate_projection and bayes_features == "paper" and self.fuse_paper_qkv
         )
+        # Fuse the RMSNorm feeding the complete Bayesian projection into TE's
+        # LayerNormLinear.  This is only valid when Q/K/V, learned dynamics,
+        # noise, and the read gate all share that projection; otherwise other
+        # rows still need the standalone normalized stream.
+        self.fuse_bayes_norm_linear = bool(
+            fuse_bayes_norm_linear and te_active and self.fuse_paper_qkv
+            and self.fuse_paper_projection and self.fuse_gate_projection
+            and bayes_dynamics == "learned"
+        )
         self.qkv_core_width = 2 * self.state_width + width
         self.aux_width = (
             self.state_width + 2 * heads
@@ -245,13 +266,22 @@ class BayesianMixer(nn.Module):
                 projection_width = self.qkv_core_width + self.aux_width
                 if self.fuse_gate_projection:
                     projection_width += width
-                self.qkv_proj = factory.linear(
+                fused_norm_linear = (
+                    factory.layernorm_linear(width, projection_width, bias=False)
+                    if self.fuse_bayes_norm_linear else None
+                )
+                self.qkv_proj = fused_norm_linear or factory.linear(
                     width, projection_width,
                     # Legacy Q/K/V projections are bias-free.  Keep the
                     # auxiliary rows bias-only via ``aux_bias`` below so the
                     # fused module has exactly the same parameter count.
                     bias=False,
                 )
+                if fused_norm_linear is not None:
+                    # LayerNormLinear owns the RMSNorm weight.  Keep the
+                    # attribute as Identity so the forward path does not
+                    # normalize twice and the module remains serializable.
+                    self.norm = nn.Identity()
                 self.aux_bias = None
                 if self.aux_width:
                     self.aux_bias = nn.Parameter(
@@ -298,7 +328,8 @@ class BayesianMixer(nn.Module):
                 nn.init.zeros_(self.rotation_proj.bias)
                 half_lives = torch.logspace(
                     math.log10(32.0), math.log10(4096.0), self.state_width // 2,
-                    device=self.norm.weight.device, dtype=torch.float32,
+                    device=(self.qkv_proj.weight.device if hasattr(self, "qkv_proj")
+                            else self.norm.weight.device), dtype=torch.float32,
                 )
                 raw = torch.log(torch.expm1(math.log(2.0) / half_lives))
                 rotation_bias = self.rotation_proj.bias.data.view(
@@ -323,7 +354,8 @@ class BayesianMixer(nn.Module):
                     # projection layouts.  The unfused reference path does
                     # not create ``qkv_proj`` and must still be constructible
                     # when ``--no-paper-fused-qkv`` is used.
-                    device=self.norm.weight.device, dtype=torch.float32,
+                    device=(self.qkv_proj.weight.device if hasattr(self, "qkv_proj")
+                            else self.norm.weight.device), dtype=torch.float32,
                 )
                 # rho=exp(-softplus(raw)); inverse-softplus(-log(rho))
                 # initializes the transition exactly at each half-life.
@@ -468,6 +500,16 @@ class BayesianMixer(nn.Module):
             gate_key = prefix + "g_proj.weight"
             if self.fuse_gate_projection and gate_key not in state_dict:
                 state_dict[gate_key] = qkv[self.qkv_core_width + self.aux_width :]
+        # LayerNormLinear stores the shared RMSNorm weight alongside its
+        # projection. Translate checkpoints from the standalone norm layout
+        # in both directions so the opt-in fusion remains checkpoint-safe.
+        fused_norm_key = prefix + "qkv_proj.layer_norm_weight"
+        norm_key = prefix + "norm.weight"
+        if self.fuse_bayes_norm_linear:
+            if norm_key in state_dict and fused_norm_key not in state_dict:
+                state_dict[fused_norm_key] = state_dict.pop(norm_key)
+        elif fused_norm_key in state_dict and norm_key not in state_dict:
+            state_dict[norm_key] = state_dict.pop(fused_norm_key)
         super()._load_from_state_dict(
             state_dict, prefix, local_metadata, strict, missing_keys,
             unexpected_keys, error_msgs,
@@ -661,6 +703,7 @@ class HybridBlock(nn.Module):
         fuse_paper_projection: bool = True,
         fuse_te_aux_projection: bool = False,
         bf16_state_projection: bool = False,
+        fuse_bayes_norm_linear: bool = False,
     ) -> None:
         super().__init__()
         self.kind = kind
@@ -674,6 +717,7 @@ class HybridBlock(nn.Module):
                 fuse_paper_projection=fuse_paper_projection,
                 fuse_te_aux_projection=fuse_te_aux_projection,
                 bf16_state_projection=bf16_state_projection,
+                fuse_bayes_norm_linear=fuse_bayes_norm_linear,
             )
         elif kind == "fa":
             self.mixer = GQAAttention(width, heads, kv_heads, factory)
@@ -710,6 +754,7 @@ class SixLayerLM(nn.Module):
         fuse_paper_projection: bool = True,
         fuse_te_aux_projection: bool = False,
         bf16_state_projection: bool = False,
+        fuse_bayes_norm_linear: bool = False,
     ) -> None:
         super().__init__()
         self.vocab_size = vocab_size
@@ -727,6 +772,7 @@ class SixLayerLM(nn.Module):
                 fuse_paper_projection=fuse_paper_projection,
                 fuse_te_aux_projection=fuse_te_aux_projection,
                 bf16_state_projection=bf16_state_projection,
+                fuse_bayes_norm_linear=fuse_bayes_norm_linear,
             )
             for kind in self.block_kinds
         )
@@ -886,6 +932,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         fuse_paper_projection=args.fuse_paper_projection,
         fuse_te_aux_projection=args.fuse_te_aux_projection,
         bf16_state_projection=args.bf16_state_projection,
+        fuse_bayes_norm_linear=args.fuse_bayes_norm_linear,
     ).to(device)
     # Compile the dense attention and SwiGLU components independently.  This
     # preserves the custom Bayesian recurrence boundary while fusing the
@@ -1100,6 +1147,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         "fuse_gate_projection": bool(args.fuse_gate_projection),
         "fuse_te_aux_projection": bool(args.fuse_te_aux_projection),
         "bf16_state_projection": bool(args.bf16_state_projection),
+        "fuse_bayes_norm_linear": bool(args.fuse_bayes_norm_linear),
         "bayes_features": args.bayes_features,
         "fuse_paper_qkv": bool(args.fuse_paper_qkv),
         "fuse_paper_projection": bool(args.fuse_paper_projection),
@@ -1176,6 +1224,8 @@ def main() -> None:
                         help="opt into a shared TE FP8 scale for Q/K/V plus decay/noise (stability/perf tradeoff)")
     parser.add_argument("--bf16-state-projection", action="store_true",
                         help="run Bayesian SiLU/normalization in BF16 and cast to FP32 at the recurrent boundary")
+    parser.add_argument("--fuse-bayes-norm-linear", action="store_true",
+                        help="fuse the Bayesian input RMSNorm into the TE projection (opt-in performance mode)")
     parser.add_argument("--seq", type=int, default=512)
     parser.add_argument("--batch", type=int, default=1)
     parser.add_argument("--steps", type=int, default=20)
