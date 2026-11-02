@@ -138,7 +138,7 @@ paper mechanisms but has lower state capacity than the default D=8 row.
 |---|---:|---|---:|---:|---:|
 | Mamba-3 TE FP8 matched hybrid | 101.916M | Mamba-3 SISO + GQA | **385,083 tok/s** | 63,415 MiB | 10.3737 |
 | Bayesian TE FP8, all optimizations | 101.828M | D=1, M=8; scalar covariance/head | **391,105 tok/s** | 62,801 MiB | 10.3883 |
-| Bayesian TE FP8, all optimizations | 101.928M | D=2, M=8; dense 2×2 covariance/head | 355,014 tok/s | 61,610 MiB | 10.3837 |
+| Bayesian TE FP8, two-head grouped kernel | 101.928M | D=2, M=8; dense 2×2 covariance/head | **368,171 tok/s** | 61,994 MiB | 10.3826 |
 | Bayesian TE FP8, optimized D=4 | 99.918M | D=4, M=8; dense 4×4 covariance/head | 323,185 tok/s | 62,492 MiB | 10.4752 |
 | Bayesian TE FP8, optimized D=8 | 101.500M | D=8, M=8; dense 8×8 covariance/head | 298,740 tok/s | 63,480 MiB | 10.4705 |
 
@@ -171,7 +171,7 @@ python example/train_6layer.py --device cuda:0 --precision te-fp8 \
 ```
 
 The current raw records are [Bayesian D=1](example/results/gb300_6layer_bayes_d1_tefp8_current.json),
-[Bayesian D=2](example/results/gb300_6layer_bayes_d2_tefp8_current.json), and
+[Bayesian D=2](example/results/gb300_6layer_bayes_d2_tefp8_twohead_b120.json), and
 [Mamba-3](example/results/gb300_6layer_mamba3_tefp8_current.json). The latest
 two-head D=1 records are [Bayesian MLP=8736](example/results/gb300_6layer_bayes_d1_tefp8_twohead_8736_b120.json),
 [Bayesian MLP=8576](example/results/gb300_6layer_bayes_d1_tefp8_twohead_8576_b120.json),
