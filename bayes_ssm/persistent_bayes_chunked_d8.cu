@@ -381,9 +381,12 @@ __global__ void fused_backward_chunk_kernel(
   const int b=blockIdx.x, tid=threadIdx.x;
   if (b>=n) return;
   extern __shared__ float sm[];
-  // State and temporary vectors/matrices.
-  float* mean=sm; float* cov=mean+D*M; float* cp=cov+D*D;
-  float* u=cp+D*D; float* err=u+D; float* gM=err+M;
+  // State and temporary vectors/matrices.  The predicted covariance is kept
+  // directly in the per-token shared history (hpp); there is no need for a
+  // second ``cp`` tile because the reverse pass consumes hpp and the forward
+  // update can read it after the innovation vector has been formed.
+  float* mean=sm; float* cov=mean+D*M;
+  float* u=cov+D*D; float* err=u+D; float* gM=err+M;
   float* gC=gM+D*M; float* gMprev=gC+D*D; float* gCprev=gMprev+D*M;
   float* ge=gCprev+D*D; float* gu=ge+M; float* gk=gu+D;
   float* red=gk+D;
@@ -407,20 +410,20 @@ __global__ void fused_backward_chunk_kernel(
     const float* v=values+((size_t)b*t+ti)*M;
     const float* d=decay+((size_t)b*t+ti)*D;
     float pv=process[(size_t)b*t+ti], rv=observation[(size_t)b*t+ti];
-    for(int x=tid;x<D*D;x+=THREADS){int i=x/D,j=x%D;if(i<=j){float z=cov[i*D+j]*d[i]*d[j]+(i==j?pv:0.f);cp[i*D+j]=z;cp[j*D+i]=z;}}
+    float* hpp_t = hpp+(size_t)li*D*D;
+    for(int x=tid;x<D*D;x+=THREADS){int i=x/D,j=x%D;hpp_t[x]=cov[i*D+j]*d[i]*d[j]+(i==j?pv:0.f);}
     __syncthreads();
-    for(int i=tid;i<D;i+=THREADS){float z=0.f;for(int j=0;j<D;++j)z+=cp[i*D+j]*k[j];u[i]=z;}
+    for(int i=tid;i<D;i+=THREADS){float z=0.f;for(int j=0;j<D;++j)z+=cov[i*D+j]*d[j]*k[j];u[i]=d[i]*z+pv*k[i];}
     __syncthreads();
     if(tid==0){float z=rv;for(int i=0;i<D;++i)z+=k[i]*u[i];scalars[0]=fmaxf(z,floor);hbh[li]=1.f/scalars[0];}
     for(int c=tid;c<M;c+=THREADS){float z=0.f;for(int i=0;i<D;++i)z+=d[i]*mean[i*M+c]*k[i];err[c]=v[c]-z;}
     __syncthreads();
     const float beta=hbh[li];
     for(int x=tid;x<D*M;x+=THREADS){int i=x/M;hmp[(size_t)li*D*M+x]=d[i]*mean[x];heh[(size_t)li*M+(x%M)]=err[x%M];}
-    for(int x=tid;x<D*D;x+=THREADS)hpp[(size_t)li*D*D+x]=cp[x];
     for(int i=tid;i<D;i+=THREADS)huh[(size_t)li*D+i]=u[i];
     for(int x=tid;x<D*M;x+=THREADS){int i=x/M,c=x%M;mean[x]=d[i]*mean[x]+beta*u[i]*err[c];}
     __syncthreads();
-    for(int x=tid;x<D*D;x+=THREADS){int i=x/D,j=x%D;if(i<=j){float z=cp[i*D+j]-beta*u[i]*u[j];cov[i*D+j]=z;cov[j*D+i]=z;}}
+    for(int x=tid;x<D*D;x+=THREADS){int i=x/D,j=x%D;if(i<=j){float z=hpp_t[x]-beta*u[i]*u[j];cov[i*D+j]=z;cov[j*D+i]=z;}}
     __syncthreads();
   }
   // Reverse replay.  This is algebraically identical to backward_chunk_kernel
@@ -501,10 +504,13 @@ std::vector<torch::Tensor> backward_chunked_impl(
  // avoiding the global history tensors and the separate recompute launch.
  // Keep the existing path for unusually large chunks so dynamic shared
  // memory usage remains within the device limit.
- if (chunks <= 128) {
+ if constexpr (!FIXED) if (chunks <= 128) {
    constexpr int fth = 64;
-   const size_t base_floats = 3*8*8 + 2*8*8 + 2*8 + 8 + 2*8*8 + 8*8 + 8 + 2*8 + fth;
-   const size_t hist_floats = (size_t)chunks * (2*8*8 + 8*8 + 8 + 8 + 1);
+   // Match the exact pointer layout in fused_backward_chunk_kernel.  Keeping
+   // this tight matters for occupancy on SM103 (the former conservative
+   // estimate reserved an extra ~9 KiB at chunk=64).
+   const size_t base_floats = 552; // state/gradient tiles plus reduction
+   const size_t hist_floats = (size_t)chunks * 145; // hmp+hpp+huh+hbh+heh
    const size_t shared_bytes = (base_floats + hist_floats) * sizeof(float);
    cudaFuncSetAttribute(fused_backward_chunk_kernel<8,8,fth,NEED_DYNAMICS>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)shared_bytes);
    auto st = at::cuda::getCurrentCUDAStream();
