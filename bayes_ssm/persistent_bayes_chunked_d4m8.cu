@@ -186,8 +186,8 @@ __global__ void chunk_forward_kernel(
  float* __restrict__ mean_final,float* __restrict__ cov_final,float* __restrict__ bmean,float* __restrict__ bcov,
  int n,int t,int chunks,int nb,float floor) {
  int b=blockIdx.x,tid=threadIdx.x;if(b>=n)return; extern __shared__ float sm[];
- float* mean=sm;float* cov=mean+D*M;float* cp=cov+D*D;
- float* u=FIXED ? cov+D*D : cp+D*D;float* err=u+D;float* si=err+M;
+ float* mean=sm;float* cov=mean+D*M;
+ float* u=cov+D*D;float* wk=u+D;float* err=wk+D;float* si=err+M;
  for(int x=tid;x<D*M;x+=THREADS) mean[x]=mean0[b*D*M+x];
  for(int x=tid;x<D*D;x+=THREADS) cov[x]=cov0[b*D*D+x]; __syncthreads();
  for(int x=tid;x<D*M;x+=THREADS) bmean[b*(nb+1)*D*M+x]=mean[x];
@@ -195,19 +195,15 @@ __global__ void chunk_forward_kernel(
  for(int ti=0;ti<t;++ti) {
    if(ti>0 && (ti%chunks)==0) {int c=ti/chunks; for(int x=tid;x<D*M;x+=THREADS)bmean[(b*(nb+1)+c)*D*M+x]=mean[x];for(int x=tid;x<D*D;x+=THREADS)bcov[(b*(nb+1)+c)*D*D+x]=cov[x];}
    const float* k=keys+(b*t+ti)*D;const float* v=values+(b*t+ti)*M;const float* q=queries+(b*t+ti)*D;const float* d=decay+(b*t+ti)*D;float pv=FIXED?0.1f:process[b*t+ti],rv=FIXED?1.0f:observation[b*t+ti];
-   if constexpr (!FIXED) {
-     // Covariance is symmetric after every update.  Materialize the upper
-     // triangle and mirror it, avoiding duplicate D-by-D prediction work.
-     for(int x=tid;x<D*D;x+=THREADS){int i=x/D,j=x%D;if(i<=j){float value=cov[i*D+j]*d[i]*d[j]+(i==j?pv:0.f);cp[i*D+j]=value;cp[j*D+i]=value;}}
-   }
-   __syncthreads();
    if constexpr (FIXED) {
      // For A=rho I and Q=qI, compute Pk without rereading the freshly
      // materialized covariance prediction.  The diagonal process term is
      // folded into the final element, preserving the same recurrence.
      for(int i=tid;i<D;i+=THREADS){float z=0;for(int j=0;j<D;++j)z+=cov[i*D+j]*k[j];u[i]=0.9409f*z+0.1f*k[i];}
    } else {
-     for(int i=tid;i<D;i+=THREADS){float z=0;for(int j=0;j<D;++j)z+=cp[i*D+j]*k[j];u[i]=z;}
+     for(int j=tid;j<D;j+=THREADS) wk[j]=d[j]*k[j];
+     __syncthreads();
+     for(int i=tid;i<D;i+=THREADS){float z=0;for(int j=0;j<D;++j)z+=cov[i*D+j]*wk[j];u[i]=d[i]*z+pv*k[i];}
    }
    __syncthreads();
    if(tid==0){float z=rv;for(int i=0;i<D;++i)z+=k[i]*u[i];si[0]=fmaxf(z,floor);} 
@@ -225,7 +221,7 @@ __global__ void chunk_forward_kernel(
        }
      }
    } else {
-     for(int x=tid;x<D*D;x+=THREADS){int i=x/D,j=x%D;if(i<=j){float value=cp[i*D+j]-beta*u[i]*u[j];cov[i*D+j]=value;cov[j*D+i]=value;}}
+     for(int x=tid;x<D*D;x+=THREADS){int i=x/D,j=x%D;if(i<=j){float value=cov[i*D+j]*d[i]*d[j]+(i==j?pv:0.f)-beta*u[i]*u[j];cov[i*D+j]=value;cov[j*D+i]=value;}}
    }
    __syncthreads();
    for(int c=tid;c<M;c+=THREADS){float z=0;for(int i=0;i<D;++i)z+=mean[i*M+c]*q[i];outputs[(b*t+ti)*M+c]=z;} __syncthreads();
@@ -239,24 +235,26 @@ __global__ void recompute_chunk_kernel(
  const float* __restrict__ keys,const float* __restrict__ values,const float* __restrict__ decay,const float* __restrict__ process,const float* __restrict__ observation,
  const float* __restrict__ bmean,const float* __restrict__ bcov,float* __restrict__ mp,float* __restrict__ pp,float* __restrict__ uh,float* __restrict__ bh,float* __restrict__ eh,
  int n,int t,int chunks,int nb,int ci,float floor) {
- int b=blockIdx.x,tid=threadIdx.x;if(b>=n)return;extern __shared__ float sm[];float* mean=sm;float* cov=mean+D*M;float* cp=cov+D*D;float* u=FIXED ? cov+D*D : cp+D*D;float* err=u+D;float* si=err+M;
+ int b=blockIdx.x,tid=threadIdx.x;if(b>=n)return;extern __shared__ float sm[];float* mean=sm;float* cov=mean+D*M;
+ float* u=cov+D*D;float* wk=u+D;float* err=wk+D;float* si=err+M;
  size_t bo=(size_t)b*(nb+1);for(int x=tid;x<D*M;x+=THREADS)mean[x]=bmean[bo*D*M+(size_t)ci*D*M+x];for(int x=tid;x<D*D;x+=THREADS)cov[x]=bcov[bo*D*D+(size_t)ci*D*D+x];__syncthreads();
  int start=ci*chunks,len=min(chunks,t-start);for(int li=0;li<len;++li){int ti=start+li;size_t hb=(size_t)b*(size_t)chunks+(size_t)li;const float*k=keys+((size_t)b*t+ti)*D;const float*v=values+((size_t)b*t+ti)*M;const float*d=decay+((size_t)b*t+ti)*D;float pv=FIXED?0.1f:process[(size_t)b*t+ti],rv=FIXED?1.0f:observation[(size_t)b*t+ti];
    if constexpr (!FIXED) {
-     for(int x=tid;x<D*D;x+=THREADS){int i=x/D,j=x%D;if(i<=j){float value=cov[i*D+j]*d[i]*d[j]+(i==j?pv:0.f);cp[i*D+j]=value;cp[j*D+i]=value;}}
+     for(int x=tid;x<D*D;x+=THREADS){int i=x/D,j=x%D;if(i<=j)pp[hb*D*D+i*D+j]=cov[i*D+j]*d[i]*d[j]+(i==j?pv:0.f);}
    }
    __syncthreads();
    if constexpr (FIXED) {
      for(int i=tid;i<D;i+=THREADS){float z=0;for(int j=0;j<D;++j)z+=cov[i*D+j]*k[j];u[i]=0.9409f*z+0.1f*k[i];}
    } else {
-     for(int i=tid;i<D;i+=THREADS){float z=0;for(int j=0;j<D;++j)z+=cp[i*D+j]*k[j];u[i]=z;}
+     for(int j=tid;j<D;j+=THREADS) wk[j]=d[j]*k[j];
+     __syncthreads();
+     for(int i=tid;i<D;i+=THREADS){float z=0;for(int j=0;j<D;++j)z+=cov[i*D+j]*wk[j];u[i]=d[i]*z+pv*k[i];}
    }
    __syncthreads();if(tid==0){float z=rv;for(int i=0;i<D;++i)z+=k[i]*u[i];si[0]=fmaxf(z,floor);}for(int c=tid;c<M;c+=THREADS){float z=0;for(int i=0;i<D;++i)z+=(FIXED?0.97f:d[i])*mean[i*M+c]*k[i];err[c]=v[c]-z;}__syncthreads();float beta=1.f/si[0];
    for(int x=tid;x<D*M;x+=THREADS){int i=x/M,c=x%M;mp[hb*D*M+x]=(FIXED?0.97f:d[i])*mean[x];}
    if constexpr (FIXED) {
      for(int x=tid;x<D*D;x+=THREADS){int i=x/D,j=x%D;pp[hb*D*D+x]=0.9409f*cov[x]+(i==j?0.1f:0.f);}
    } else {
-     for(int x=tid;x<D*D;x+=THREADS)pp[hb*D*D+x]=cp[x];
    }
    for(int i=tid;i<D;i+=THREADS)uh[hb*D+i]=u[i];for(int c=tid;c<M;c+=THREADS)eh[hb*M+c]=err[c];if(tid==0)bh[hb]=beta;
    for(int x=tid;x<D*M;x+=THREADS){int i=x/M,c=x%M;mean[x]=(FIXED?0.97f:d[i])*mean[x]+beta*u[i]*err[c];}__syncthreads();
@@ -269,7 +267,7 @@ __global__ void recompute_chunk_kernel(
        }
      }
    } else {
-     for(int x=tid;x<D*D;x+=THREADS){int i=x/D,j=x%D;if(i<=j){float value=cp[i*D+j]-beta*u[i]*u[j];cov[i*D+j]=value;cov[j*D+i]=value;}}
+     for(int x=tid;x<D*D;x+=THREADS){int i=x/D,j=x%D;if(i<=j){float value=cov[i*D+j]*d[i]*d[j]+(i==j?pv:0.f)-beta*u[i]*u[j];cov[i*D+j]=value;cov[j*D+i]=value;}}
    }
    __syncthreads();
  }
@@ -298,7 +296,7 @@ __global__ void backward_chunk_kernel(
      if constexpr (NEED_DYNAMICS && !FIXED) gobservation[(size_t)b*t+ti]=scalars[1];
    }__syncwarp();float gs=scalars[1];
    for(int i=tid;i<D;i+=THREADS){float a=0,bv=0;for(int c=0;c<M;++c)a+=gM[i*M+c]*e[c];for(int j=0;j<D;++j){float r=.5f*(gC[i*D+j]+gC[j*D+i]);bv+=2.f*r*u[j];}gu[i]=beta*(a-bv)+gs*k[i];gk[i]+=gs*u[i];}__syncthreads();
-   for(int i=tid;i<D;i+=THREADS){float zz=0;for(int j=0;j<D;++j)zz+=pp0[j*D+i]*gu[j];gk[i]+=zz;}for(int x=tid;x<D*D;x+=THREADS){int i=x/D,j=x%D;if(i<=j){float r=.5f*(gC[x]+gC[j*D+i]);
+   for(int i=tid;i<D;i+=THREADS){float zz=0;for(int j=0;j<D;++j){int pi=j<i?j:i;int pj=j<i?i:j;zz+=pp0[pi*D+pj]*gu[j];}gk[i]+=zz;}for(int x=tid;x<D*D;x+=THREADS){int i=x/D,j=x%D;if(i<=j){float r=.5f*(gC[x]+gC[j*D+i]);
        // P is stored as a symmetric matrix.  The u=P'k contribution must
        // be projected onto that symmetric subspace as well; otherwise the
        // initial-covariance gradient acquires a spurious antisymmetric part.
@@ -309,7 +307,7 @@ __global__ void backward_chunk_kernel(
    // reduction reads all M columns.
    __syncthreads();
    if constexpr (NEED_DYNAMICS && !FIXED) {
-     for(int i=tid;i<D;i+=THREADS){float zd=0,zm=0;const float inv_di=1.0f/d[i];for(int j=0;j<D;++j){float cpv;if(li==0)cpv=cov_prev[i*D+j];else{float zc=pp_prev[i*D+j]-beta_prev*uh_prev[i]*uh_prev[j];cpv=.5f*(zc+(pp_prev[j*D+i]-beta_prev*uh_prev[j]*uh_prev[i]));}zd+=(gCprev[i*D+j]+gCprev[j*D+i])*cpv*inv_di;}for(int c=0;c<M;++c){float mv;if(li==0)mv=mean_prev[i*M+c];else mv=mp_prev[i*M+c]+beta_prev*uh_prev[i]*eh_prev[c];zm+=gMprev[i*M+c]*mv;}gdecay[((size_t)b*t+ti)*D+i]=zd+zm;}
+     for(int i=tid;i<D;i+=THREADS){float zd=0,zm=0;const float inv_di=1.0f/d[i];for(int j=0;j<D;++j){float cpv;if(li==0)cpv=cov_prev[i*D+j];else{int pi=j<i?j:i;int pj=j<i?i:j;cpv=pp_prev[pi*D+pj]-beta_prev*uh_prev[i]*uh_prev[j];}zd+=(gCprev[i*D+j]+gCprev[j*D+i])*cpv*inv_di;}for(int c=0;c<M;++c){float mv;if(li==0)mv=mean_prev[i*M+c];else mv=mp_prev[i*M+c]+beta_prev*uh_prev[i]*eh_prev[c];zm+=gMprev[i*M+c]*mv;}gdecay[((size_t)b*t+ti)*D+i]=zd+zm;}
      float pz=0;for(int i=tid;i<D;i+=THREADS){float inv_di=1.0f/d[i];pz+=gCprev[i*D+i]*inv_di*inv_di;}pz=warp_sum_d4(pz);if(tid==0)gprocess[(size_t)b*t+ti]=pz;
    }
    if constexpr (FIXED) {
