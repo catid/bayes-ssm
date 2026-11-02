@@ -387,7 +387,7 @@ std::vector<torch::Tensor> backward_chunked_impl(
  // and scalar-state work and cuts the number of resident sequences by 4x.
  constexpr int th=8;
  constexpr size_t sh=(FIXED ? 27 : 28)*sizeof(float);
- constexpr size_t recompute_sh=(FIXED ? 19 : 20)*sizeof(float);
+ constexpr size_t recompute_sh=(FIXED ? 19 : 27)*sizeof(float);
  cudaFuncSetAttribute(recompute_chunk_kernel<1,8,th,FIXED>,cudaFuncAttributeMaxDynamicSharedMemorySize,(int)recompute_sh);
  auto st=at::cuda::getCurrentCUDAStream();
  for(int ci=nb-1;ci>=0;--ci){
