@@ -53,20 +53,22 @@ projections, TE fused RMSNorm, a 32k tied vocabulary head, GQA in blocks 3 and
 the exact dense-covariance recurrence with the paper's causal Q/K/V short
 convolutions, input-dependent process/observation noise, and input-dependent
 diagonal transitions. The first run pays one-time compilation cost; it is not
-included in the timed 60 steps. The raw records are [Bayesian](example/results/gb300_6layer_bayes_paper_fusedproj.json)
-and [Mamba-3](example/results/gb300_6layer_mamba3_paper_match_v2.json). The
+included in the timed 60 steps. The raw records are [Bayesian](example/results/gb300_6layer_bayes_paper_fusedproj_v2.json)
+and [Mamba-3](example/results/gb300_6layer_mamba3_paper_match_v2.json). The Mamba-3
 validation pass uses 64 sequences per GPU after timing to keep the post-run
 evaluation within available memory; this does not change the timed batch.
 
 | Model | Parameters | Mixer layout | Batch × sequence / GPU | Throughput (global / per GPU) | Peak VRAM allocated / reserved / rank | Validation loss / PPL |
 |---|---:|---|---:|---:|---:|---:|
-| Bayesian paper path | **101.942M** | Bayes, Bayes, GQA, Bayes, Bayes, GQA | 256 × 512 | **458,489 / 229,245 tok/s** | **147,033 / 189,412 MiB** | 10.3835 / 32,321 |
+| Bayesian paper path | **101.942M** | Bayes, Bayes, GQA, Bayes, Bayes, GQA | 256 × 512 | **434,006 / 217,003 tok/s** | **149,225 / 191,800 MiB** | 10.3787 / 32,168 |
 | Mamba-3 matched hybrid | **101.944M** | Mamba-3, Mamba-3, GQA, Mamba-3, Mamba-3, GQA | 256 × 512 | **1,218,503 / 609,251 tok/s** | **119,268 / 133,256 MiB** | 10.3623 / 31,645 |
 
-The recurrent state and covariance remain FP32. The paper path is about 2.66×
-slower and uses about 23% more allocated VRAM than this Mamba-3 baseline at
+The recurrent state and covariance remain FP32. The paper path is about 2.81×
+slower and uses about 25% more allocated VRAM than this Mamba-3 baseline at
 this shape; that cost is the exact dynamic dense-covariance computation, not a
-fixed-dynamics approximation.
+fixed-dynamics approximation. The Mamba validation used a 64-example per-GPU
+validation batch to avoid post-run memory pressure; validation is not part of
+the timed training measurement.
 
 Use `--bayes-backend fused` when the lower-memory custom CUDA replay path is preferred. The recorded paper-feature result uses the Inductor backend with learned input-dependent dynamics; backend rankings can change with sequence length and batch shape.
 

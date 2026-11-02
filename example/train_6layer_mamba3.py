@@ -268,8 +268,9 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     local_elapsed = time.perf_counter() - started
     elapsed = _reduce_scalar(local_elapsed, device=device, op=dist.ReduceOp.MAX) if ddp_enabled else local_elapsed
     model.eval()
+    validation_batch = args.validation_batch or args.batch
     with torch.no_grad():
-        batch = _sample_batch(valid_tokens, batch=args.batch, seq=args.seq, generator=generator).to(device)
+        batch = _sample_batch(valid_tokens, batch=validation_batch, seq=args.seq, generator=generator).to(device)
         validation_loss = F.cross_entropy(model(batch[:, :-1], factory).reshape(-1, args.vocab_size), batch[:, 1:].reshape(-1))
     validation_value = float(validation_loss)
     if ddp_enabled: validation_value = _reduce_scalar(validation_value, device=device, op=dist.ReduceOp.SUM) / world_size
@@ -300,7 +301,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         },
         "world_size": world_size, "rank": rank, "precision": "BF16 projections + TransformerEngine fused RMSNorm with FP32 tied vocabulary head" if args.fused_rmsnorm else "BF16",
         "optimizer": "capturable fused AdamW", "cuda_graph": bool(args.cuda_graph), "gpu_batch_staging": bool(gpu_batches is not None), "compile_ffn": bool(args.compile_ffn), "compile_gqa": bool(args.compile_ffn and args.mixer == "hybrid"), "chunk_size": 64,
-        "timed_steps": args.steps, "warmup_steps": args.warmup, "dataset": "synthetic random token stream (seed 123)",
+        "timed_steps": args.steps, "warmup_steps": args.warmup, "validation_batch_per_rank": validation_batch, "dataset": "synthetic random token stream (seed 123)",
         "tokens_per_second_global": args.steps * args.batch * args.seq * world_size / elapsed if elapsed else float("inf"),
         "elapsed_seconds": elapsed, "peak_allocated_mib_per_rank": torch.cuda.max_memory_allocated(device) / 2**20 if device.type == "cuda" else None,
         "peak_reserved_mib_per_rank": torch.cuda.max_memory_reserved(device) / 2**20 if device.type == "cuda" else None,
@@ -324,8 +325,14 @@ def main() -> None:
     p.add_argument("--seq", type=int, default=512); p.add_argument("--batch", type=int, default=1); p.add_argument("--steps", type=int, default=20); p.add_argument("--warmup", type=int, default=2)
     p.add_argument("--lr", type=float, default=3e-4); p.add_argument("--weight-decay", type=float, default=0.1); p.add_argument("--grad-clip", type=float, default=1.0); p.add_argument("--chunk-length", type=int, default=64)
     p.add_argument("--cuda-graph", action="store_true"); p.add_argument("--gpu-batch-staging", action="store_true"); p.add_argument("--ddp-bucket-cap-mb", type=float, default=12.0)
-    p.add_argument("--tokens", type=Path); p.add_argument("--valid-tokens", type=Path); p.add_argument("--seed", type=int, default=123); p.add_argument("--output", type=Path)
-    args = p.parse_args(); result = run(args)
+    p.add_argument("--tokens", type=Path); p.add_argument("--valid-tokens", type=Path)
+    p.add_argument("--token-dtype", choices=("auto", "uint16", "int64"), default="auto")
+    p.add_argument("--validation-batch", type=int, default=None)
+    p.add_argument("--seed", type=int, default=123); p.add_argument("--output", type=Path)
+    args = p.parse_args()
+    if args.validation_batch is not None and args.validation_batch <= 0:
+        p.error("--validation-batch must be positive")
+    result = run(args)
     if int(os.environ.get("RANK", "0")) == 0:
         print(json.dumps(result, indent=2), flush=True)
         if args.output is not None: args.output.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
