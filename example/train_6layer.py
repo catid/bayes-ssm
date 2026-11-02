@@ -202,12 +202,13 @@ class BayesianMixer(nn.Module):
             fuse_paper_projection and self.fuse_paper_qkv and not te_active
         )
         # The per-head read gate consumes the same normalized stream as the
-        # Bayesian projections.  In BF16/FP32, append it to the fused GEMM so
-        # four small launches (Q/K/V and gate) become one.  Keep TE's gate
-        # projection separate because a shared FP8 amax scale would couple the
-        # gate and state-input ranges.
+        # Bayesian projections.  When explicitly requested, append it to the
+        # fused GEMM so four small launches (Q/K/V and gate) become one.  The
+        # option is opt-in under TE FP8 because the shared output scale couples
+        # gate and state-input ranges; the default remains the safer separate
+        # projection.
         self.fuse_gate_projection = bool(
-            fuse_gate_projection and bayes_features == "paper" and self.fuse_paper_qkv and not te_active
+            fuse_gate_projection and bayes_features == "paper" and self.fuse_paper_qkv
         )
         self.qkv_core_width = 2 * self.state_width + width
         self.aux_width = (
