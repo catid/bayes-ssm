@@ -5,16 +5,16 @@
 
 namespace {
 
-__device__ __forceinline__ float warp_sum_d2(float value) {
+__device__ __forceinline__ float warp_sum_d2(float value, unsigned mask=0x0000ffffu) {
   for (int offset = 8; offset > 0; offset >>= 1)
-    value += __shfl_down_sync(0x0000ffffu, value, offset);
+    value += __shfl_down_sync(mask, value, offset);
   return value;
 }
 
 template <int THREADS>
-__device__ __forceinline__ void sync_threads_d2() {
+__device__ __forceinline__ void sync_threads_d2(unsigned mask = (THREADS == 16 ? 0x0000ffffu : 0xffffffffu)) {
   if constexpr (THREADS <= 32)
-    __syncwarp(THREADS == 16 ? 0x0000ffffu : 0xffffffffu);
+    __syncwarp(mask);
   else
     __syncthreads();
 }
@@ -189,22 +189,23 @@ std::vector<torch::Tensor> persistent_bayes_saved(
 
 namespace {
 
-template<int D,int M,int THREADS,bool FIXED=false>
+template<int D,int M,int THREADS,bool FIXED=false,int GROUPS=1>
 __global__ void chunk_forward_kernel(
  const float* __restrict__ keys,const float* __restrict__ values,const float* __restrict__ queries,
  const float* __restrict__ decay,const float* __restrict__ process,const float* __restrict__ observation,
  const float* __restrict__ mean0,const float* __restrict__ cov0,float* __restrict__ outputs,
  float* __restrict__ mean_final,float* __restrict__ cov_final,float* __restrict__ bmean,float* __restrict__ bcov,
  int n,int t,int chunks,int nb,float floor) {
- int b=blockIdx.x,tid=threadIdx.x;if(b>=n)return; extern __shared__ float sm[];
+ int tid0=threadIdx.x; int group=tid0/THREADS; int b=blockIdx.x*GROUPS+group,tid=tid0%THREADS;if(b>=n)return; extern __shared__ float sm[];
+ constexpr int PER=D*M+D*D+2*D+M+1; float* sm_base=sm+group*PER;
  // Compute the dynamic innovation vector directly from the old covariance;
  // cp is never consumed after its matvec and needlessly costs a shared tile.
- float* mean=sm;float* cov=mean+D*M;
+ float* mean=sm_base;float* cov=mean+D*M;
  float* u=cov+D*D;float* wk=u+D;float* err=wk+D;float* si=err+M;
  for(int x=tid;x<D*M;x+=THREADS) mean[x]=mean0[b*D*M+x];
- for(int x=tid;x<D*D;x+=THREADS) cov[x]=cov0[b*D*D+x]; sync_threads_d2<THREADS>();
+ for(int x=tid;x<D*D;x+=THREADS) cov[x]=cov0[b*D*D+x]; sync_threads_d2<THREADS>(0xffffu << (group*16));
  for(int x=tid;x<D*M;x+=THREADS) bmean[b*(nb+1)*D*M+x]=mean[x];
- for(int x=tid;x<D*D;x+=THREADS) bcov[b*(nb+1)*D*D+x]=cov[x]; sync_threads_d2<THREADS>();
+ for(int x=tid;x<D*D;x+=THREADS) bcov[b*(nb+1)*D*D+x]=cov[x]; sync_threads_d2<THREADS>(0xffffu << (group*16));
  for(int ti=0;ti<t;++ti) {
    if(ti>0 && (ti%chunks)==0) {int c=ti/chunks; for(int x=tid;x<D*M;x+=THREADS)bmean[(b*(nb+1)+c)*D*M+x]=mean[x];for(int x=tid;x<D*D;x+=THREADS)bcov[(b*(nb+1)+c)*D*D+x]=cov[x];}
    const float* k=keys+(b*t+ti)*D;const float* v=values+(b*t+ti)*M;const float* q=queries+(b*t+ti)*D;const float* d=decay+(b*t+ti)*D;float pv=FIXED?0.1f:process[b*t+ti],rv=FIXED?1.0f:observation[b*t+ti];
@@ -215,14 +216,14 @@ __global__ void chunk_forward_kernel(
      for(int i=tid;i<D;i+=THREADS){float z=0;for(int j=0;j<D;++j)z+=cov[i*D+j]*k[j];u[i]=0.9409f*z+0.1f*k[i];}
    } else {
      for(int j=tid;j<D;j+=THREADS) wk[j]=d[j]*k[j];
-     sync_threads_d2<THREADS>();
+     sync_threads_d2<THREADS>(0xffffu << (group*16));
      for(int i=tid;i<D;i+=THREADS){float z=0;for(int j=0;j<D;++j)z+=cov[i*D+j]*wk[j];u[i]=d[i]*z+pv*k[i];}
    }
-   sync_threads_d2<THREADS>();
+   sync_threads_d2<THREADS>(0xffffu << (group*16));
    if(tid==0){float z=rv;for(int i=0;i<D;++i)z+=k[i]*u[i];si[0]=fmaxf(z,floor);} 
-   for(int c=tid;c<M;c+=THREADS){float z=0;for(int i=0;i<D;++i)z+=(FIXED?0.97f:d[i])*mean[i*M+c]*k[i];err[c]=v[c]-z;} sync_threads_d2<THREADS>();float beta=1.f/si[0];
+   for(int c=tid;c<M;c+=THREADS){float z=0;for(int i=0;i<D;++i)z+=(FIXED?0.97f:d[i])*mean[i*M+c]*k[i];err[c]=v[c]-z;} sync_threads_d2<THREADS>(0xffffu << (group*16));float beta=1.f/si[0];
    for(int x=tid;x<D*M;x+=THREADS){int i=x/M,c=x%M;mean[x]=(FIXED?0.97f:d[i])*mean[x]+beta*u[i]*err[c];}
-   sync_threads_d2<THREADS>();
+   sync_threads_d2<THREADS>(0xffffu << (group*16));
    if constexpr (FIXED) {
      // The fixed recurrence preserves symmetry. Compute each upper-triangle
      // entry once and mirror it, halving the covariance update arithmetic.
@@ -236,35 +237,36 @@ __global__ void chunk_forward_kernel(
    } else {
      for(int x=tid;x<D*D;x+=THREADS){int i=x/D,j=x%D;if(i<=j){float value=cov[i*D+j]*d[i]*d[j]+(i==j?pv:0.f)-beta*u[i]*u[j];cov[i*D+j]=value;cov[j*D+i]=value;}}
    }
-   sync_threads_d2<THREADS>();
-   for(int c=tid;c<M;c+=THREADS){float z=0;for(int i=0;i<D;++i)z+=mean[i*M+c]*q[i];outputs[(b*t+ti)*M+c]=z;} sync_threads_d2<THREADS>();
+   sync_threads_d2<THREADS>(0xffffu << (group*16));
+   for(int c=tid;c<M;c+=THREADS){float z=0;for(int i=0;i<D;++i)z+=mean[i*M+c]*q[i];outputs[(b*t+ti)*M+c]=z;} sync_threads_d2<THREADS>(0xffffu << (group*16));
  }
  for(int x=tid;x<D*M;x+=THREADS)mean_final[b*D*M+x]=mean[x];for(int x=tid;x<D*D;x+=THREADS)cov_final[b*D*D+x]=cov[x];
  for(int x=tid;x<D*M;x+=THREADS)bmean[(b*(nb+1)+nb)*D*M+x]=mean[x];for(int x=tid;x<D*D;x+=THREADS)bcov[(b*(nb+1)+nb)*D*D+x]=cov[x];
 }
 
-template<int D,int M,int THREADS,bool FIXED=false>
+template<int D,int M,int THREADS,bool FIXED=false,int GROUPS=1>
 __global__ void recompute_chunk_kernel(
  const float* __restrict__ keys,const float* __restrict__ values,const float* __restrict__ decay,const float* __restrict__ process,const float* __restrict__ observation,
  const float* __restrict__ bmean,const float* __restrict__ bcov,float* __restrict__ mp,float* __restrict__ pp,float* __restrict__ uh,float* __restrict__ bh,float* __restrict__ eh,
  int n,int t,int chunks,int nb,int ci,float floor) {
- int b=blockIdx.x,tid=threadIdx.x;if(b>=n)return;extern __shared__ float sm[];float* mean=sm;float* cov=mean+D*M;
+ int tid0=threadIdx.x; int group=tid0/THREADS; int b=blockIdx.x*GROUPS+group,tid=tid0%THREADS;if(b>=n)return;extern __shared__ float sm[];
+ constexpr int PER=D*M+D*D+2*D+2*M; float* sm_base=sm+group*PER;float* mean=sm_base;float* cov=mean+D*M;
  float* u=cov+D*D;float* wk=u+D;float* err=wk+D;float* si=err+M;
- size_t bo=(size_t)b*(nb+1);for(int x=tid;x<D*M;x+=THREADS)mean[x]=bmean[bo*D*M+(size_t)ci*D*M+x];for(int x=tid;x<D*D;x+=THREADS)cov[x]=bcov[bo*D*D+(size_t)ci*D*D+x];sync_threads_d2<THREADS>();
+ size_t bo=(size_t)b*(nb+1);for(int x=tid;x<D*M;x+=THREADS)mean[x]=bmean[bo*D*M+(size_t)ci*D*M+x];for(int x=tid;x<D*D;x+=THREADS)cov[x]=bcov[bo*D*D+(size_t)ci*D*D+x];sync_threads_d2<THREADS>(0xffffu << (group*16));
  int start=ci*chunks,len=min(chunks,t-start);for(int li=0;li<len;++li){int ti=start+li;size_t hb=(size_t)b*(size_t)chunks+(size_t)li;const float*k=keys+((size_t)b*t+ti)*D;const float*v=values+((size_t)b*t+ti)*M;const float*d=decay+((size_t)b*t+ti)*D;float pv=FIXED?0.1f:process[(size_t)b*t+ti],rv=FIXED?1.0f:observation[(size_t)b*t+ti];
    if constexpr (!FIXED) {
      // Replay history stores the symmetric predicted covariance once.
      for(int x=tid;x<D*D;x+=THREADS){int i=x/D,j=x%D;if(i<=j)pp[hb*D*D+i*D+j]=cov[i*D+j]*d[i]*d[j]+(i==j?pv:0.f);}
    }
-   sync_threads_d2<THREADS>();
+   sync_threads_d2<THREADS>(0xffffu << (group*16));
    if constexpr (FIXED) {
      for(int i=tid;i<D;i+=THREADS){float z=0;for(int j=0;j<D;++j)z+=cov[i*D+j]*k[j];u[i]=0.9409f*z+0.1f*k[i];}
    } else {
      for(int j=tid;j<D;j+=THREADS) wk[j]=d[j]*k[j];
-     sync_threads_d2<THREADS>();
+     sync_threads_d2<THREADS>(0xffffu << (group*16));
      for(int i=tid;i<D;i+=THREADS){float z=0;for(int j=0;j<D;++j)z+=cov[i*D+j]*wk[j];u[i]=d[i]*z+pv*k[i];}
    }
-   sync_threads_d2<THREADS>();if(tid==0){float z=rv;for(int i=0;i<D;++i)z+=k[i]*u[i];si[0]=fmaxf(z,floor);}for(int c=tid;c<M;c+=THREADS){float z=0;for(int i=0;i<D;++i)z+=(FIXED?0.97f:d[i])*mean[i*M+c]*k[i];err[c]=v[c]-z;}sync_threads_d2<THREADS>();float beta=1.f/si[0];
+   sync_threads_d2<THREADS>(0xffffu << (group*16));if(tid==0){float z=rv;for(int i=0;i<D;++i)z+=k[i]*u[i];si[0]=fmaxf(z,floor);}for(int c=tid;c<M;c+=THREADS){float z=0;for(int i=0;i<D;++i)z+=(FIXED?0.97f:d[i])*mean[i*M+c]*k[i];err[c]=v[c]-z;}sync_threads_d2<THREADS>(0xffffu << (group*16));float beta=1.f/si[0];
    for(int x=tid;x<D*M;x+=THREADS){int i=x/M,c=x%M;mp[hb*D*M+x]=(FIXED?0.97f:d[i])*mean[x];}
    if constexpr (FIXED) {
      for(int x=tid;x<D*D;x+=THREADS){int i=x/D,j=x%D;pp[hb*D*D+x]=0.9409f*cov[x]+(i==j?0.1f:0.f);}
@@ -272,7 +274,7 @@ __global__ void recompute_chunk_kernel(
      // pp was written directly from the previous covariance state above.
    }
    for(int i=tid;i<D;i+=THREADS)uh[hb*D+i]=u[i];for(int c=tid;c<M;c+=THREADS)eh[hb*M+c]=err[c];if(tid==0)bh[hb]=beta;
-   for(int x=tid;x<D*M;x+=THREADS){int i=x/M,c=x%M;mean[x]=(FIXED?0.97f:d[i])*mean[x]+beta*u[i]*err[c];}sync_threads_d2<THREADS>();
+   for(int x=tid;x<D*M;x+=THREADS){int i=x/M,c=x%M;mean[x]=(FIXED?0.97f:d[i])*mean[x]+beta*u[i]*err[c];}sync_threads_d2<THREADS>(0xffffu << (group*16));
    if constexpr (FIXED) {
      if (tid < D * D) {
        int i=tid / D, j=tid % D;
@@ -284,53 +286,55 @@ __global__ void recompute_chunk_kernel(
    } else {
      for(int x=tid;x<D*D;x+=THREADS){int i=x/D,j=x%D;if(i<=j){float value=cov[i*D+j]*d[i]*d[j]+(i==j?pv:0.f)-beta*u[i]*u[j];cov[i*D+j]=value;cov[j*D+i]=value;}}
    }
-   sync_threads_d2<THREADS>();
+   sync_threads_d2<THREADS>(0xffffu << (group*16));
  }
 }
 
-template<int D,int M,int THREADS,bool NEED_DYNAMICS,bool FIXED=false>
+template<int D,int M,int THREADS,bool NEED_DYNAMICS,bool FIXED=false,int GROUPS=1>
 __global__ void backward_chunk_kernel(
  const float* __restrict__ keys,const float* __restrict__ values,const float* __restrict__ queries,const float* __restrict__ decay,const float* __restrict__ process,const float* __restrict__ observation,
  const float* __restrict__ mean0,const float* __restrict__ cov0,const float* __restrict__ bmean,const float* __restrict__ bcov,
  const float* __restrict__ mp,const float* __restrict__ pp,const float* __restrict__ uh,const float* __restrict__ bh,const float* __restrict__ eh,const float* __restrict__ gy,
  float* __restrict__ gkeys,float* __restrict__ gvalues,float* __restrict__ gqueries,float* __restrict__ gdecay,float* __restrict__ gprocess,float* __restrict__ gobservation,
  float* __restrict__ gm_state,float* __restrict__ gc_state,int n,int t,int chunks,int nb,int ci,float floor) {
- int b=blockIdx.x,tid=threadIdx.x;if(b>=n)return;extern __shared__ float sm[];float*gM=sm;float*gMprev=FIXED ? gM : gM+D*M;float*gC=FIXED ? gM+D*M : gMprev+D*M;float*gCprev=gC+D*D;float*ge=gCprev+D*D;float*gu=ge+M;float*gk=gu+D;float*red=gk+D;__shared__ float scalars[3];
- for(int x=tid;x<D*M;x+=THREADS)gM[x]=gm_state[b*D*M+x];for(int x=tid;x<D*D;x+=THREADS)gC[x]=gc_state[b*D*D+x];sync_threads_d2<THREADS>();int start=ci*chunks,len=min(chunks,t-start);
+ int tid0=threadIdx.x; int group=tid0/THREADS; int b=blockIdx.x*GROUPS+group,tid=tid0%THREADS;if(b>=n)return;extern __shared__ float sm[];
+ constexpr int PER=(FIXED ? D*M : 2*D*M)+2*D*D+M+3*D+THREADS; float* sm_base=sm+group*PER;
+ float*gM=sm_base;float*gMprev=FIXED ? gM : gM+D*M;float*gC=FIXED ? gM+D*M : gMprev+D*M;float*gCprev=gC+D*D;float*ge=gCprev+D*D;float*gu=ge+M;float*gk=gu+D;float*red=gk+D;__shared__ float scalars[GROUPS][3];
+ for(int x=tid;x<D*M;x+=THREADS)gM[x]=gm_state[b*D*M+x];for(int x=tid;x<D*D;x+=THREADS)gC[x]=gc_state[b*D*D+x];sync_threads_d2<THREADS>(0xffffu << (group*16));int start=ci*chunks,len=min(chunks,t-start);
  for(int li=len-1;li>=0;--li){int ti=start+li;size_t hb=(size_t)b*(size_t)chunks+(size_t)li;const float*k=keys+((size_t)b*t+ti)*D;const float*q=queries+((size_t)b*t+ti)*D;const float*d=decay+((size_t)b*t+ti)*D;const float*mp0=mp+hb*D*M;const float*pp0=pp+hb*D*D;const float*u=uh+hb*D;const float*e=eh+hb*M;float rv=FIXED?1.0f:observation[(size_t)b*t+ti];float beta=bh[hb];const float*gyt=gy+((size_t)b*t+ti)*M;
    // derive updated mean for q gradient, then add output gradient
    for(int i=tid;i<D;i+=THREADS){float z=0;for(int c=0;c<M;++c)z+=(mp0[i*M+c]+beta*u[i]*e[c])*gyt[c];gqueries[((size_t)b*t+ti)*D+i]=z;}
-   for(int x=tid;x<D*M;x+=THREADS){int i=x/M,c=x%M;gM[x]+=q[i]*gyt[c];}sync_threads_d2<THREADS>();
-   for(int c=tid;c<M;c+=THREADS){float z=0;for(int i=0;i<D;++i)z+=gM[i*M+c]*u[i];ge[c]=beta*z;gvalues[((size_t)b*t+ti)*M+c]=ge[c];}sync_threads_d2<THREADS>();
+   for(int x=tid;x<D*M;x+=THREADS){int i=x/M,c=x%M;gM[x]+=q[i]*gyt[c];}sync_threads_d2<THREADS>(0xffffu << (group*16));
+   for(int c=tid;c<M;c+=THREADS){float z=0;for(int i=0;i<D;++i)z+=gM[i*M+c]*u[i];ge[c]=beta*z;gvalues[((size_t)b*t+ti)*M+c]=ge[c];}sync_threads_d2<THREADS>(0xffffu << (group*16));
    if constexpr (!FIXED) {
      for(int x=tid;x<D*M;x+=THREADS){int i=x/M,c=x%M;gMprev[x]=gM[x]-k[i]*ge[c];}
    }
-   for(int i=tid;i<D;i+=THREADS){float z=0;for(int c=0;c<M;++c)z+=mp0[i*M+c]*ge[c];gk[i]=-z;}sync_threads_d2<THREADS>();
-   float z=0;for(int x=tid;x<D*D;x+=THREADS){int i=x/D,j=x%D;if(i<=j){float r=.5f*(gC[x]+gC[j*D+i]);z-=r*u[i]*u[j]*(i==j?1.f:2.f);}}for(int x=tid;x<D*M;x+=THREADS){int i=x/M,c=x%M;z+=gM[x]*u[i]*e[c];}z=warp_sum_d2(z);
-   if(tid==0){float s=rv;for(int i=0;i<D;++i)s+=k[i]*u[i];scalars[0]=z;scalars[1]=(s>floor)?-z*beta*beta:0.f;
-     if constexpr (NEED_DYNAMICS && !FIXED) gobservation[(size_t)b*t+ti]=scalars[1];
-   }__syncwarp(0x0000ffffu);float gs=scalars[1];
-   for(int i=tid;i<D;i+=THREADS){float a=0,bv=0;for(int c=0;c<M;++c)a+=gM[i*M+c]*e[c];for(int j=0;j<D;++j){float r=.5f*(gC[i*D+j]+gC[j*D+i]);bv+=2.f*r*u[j];}gu[i]=beta*(a-bv)+gs*k[i];gk[i]+=gs*u[i];}sync_threads_d2<THREADS>();
+   for(int i=tid;i<D;i+=THREADS){float z=0;for(int c=0;c<M;++c)z+=mp0[i*M+c]*ge[c];gk[i]=-z;}sync_threads_d2<THREADS>(0xffffu << (group*16));
+   float z=0;for(int x=tid;x<D*D;x+=THREADS){int i=x/D,j=x%D;if(i<=j){float r=.5f*(gC[x]+gC[j*D+i]);z-=r*u[i]*u[j]*(i==j?1.f:2.f);}}for(int x=tid;x<D*M;x+=THREADS){int i=x/M,c=x%M;z+=gM[x]*u[i]*e[c];}z=warp_sum_d2(z, 0xffffu << (group*16));
+   if(tid==0){float s=rv;for(int i=0;i<D;++i)s+=k[i]*u[i];scalars[group][0]=z;scalars[group][1]=(s>floor)?-z*beta*beta:0.f;
+     if constexpr (NEED_DYNAMICS && !FIXED) gobservation[(size_t)b*t+ti]=scalars[group][1];
+   }__syncwarp(0xffffu << (group*16));float gs=scalars[group][1];
+   for(int i=tid;i<D;i+=THREADS){float a=0,bv=0;for(int c=0;c<M;++c)a+=gM[i*M+c]*e[c];for(int j=0;j<D;++j){float r=.5f*(gC[i*D+j]+gC[j*D+i]);bv+=2.f*r*u[j];}gu[i]=beta*(a-bv)+gs*k[i];gk[i]+=gs*u[i];}sync_threads_d2<THREADS>(0xffffu << (group*16));
    for(int i=tid;i<D;i+=THREADS){float zz=0;for(int j=0;j<D;++j){int pi=j<i?j:i;int pj=j<i?i:j;zz+=pp0[pi*D+pj]*gu[j];}gk[i]+=zz;}for(int x=tid;x<D*D;x+=THREADS){int i=x/D,j=x%D;if(i<=j){float r=.5f*(gC[x]+gC[j*D+i]);
        // P is stored as a symmetric matrix.  The u=P'k contribution must
        // be projected onto that symmetric subspace as well; otherwise the
        // initial-covariance gradient acquires a spurious antisymmetric part.
        float gu_sym=0.5f*(gu[i]*k[j]+gu[j]*k[i]);
-       float value=(r+gu_sym)*(FIXED?0.9409f:d[i]*d[j]);gCprev[i*D+j]=value;gCprev[j*D+i]=value;}}sync_threads_d2<THREADS>();
+       float value=(r+gu_sym)*(FIXED?0.9409f:d[i]*d[j]);gCprev[i*D+j]=value;gCprev[j*D+i]=value;}}sync_threads_d2<THREADS>(0xffffu << (group*16));
    const float*mean_prev;const float*cov_prev;float beta_prev=0;const float*mp_prev=nullptr;const float*uh_prev=nullptr;const float*eh_prev=nullptr;const float*pp_prev=nullptr; if(li==0){mean_prev=bmean+((size_t)b*(nb+1)+ci)*D*M;cov_prev=bcov+((size_t)b*(nb+1)+ci)*D*D;}else{size_t hp=(size_t)b*chunks+(size_t)(li-1);mp_prev=mp+hp*D*M;uh_prev=uh+hp*D;eh_prev=eh+hp*M;pp_prev=pp+hp*D*D;beta_prev=bh[hp];}
    // gMprev is produced cooperatively above; wait before the per-row decay
    // reduction reads all M columns.
-   sync_threads_d2<THREADS>();
+   sync_threads_d2<THREADS>(0xffffu << (group*16));
    if constexpr (NEED_DYNAMICS && !FIXED) {
      for(int i=tid;i<D;i+=THREADS){float zd=0,zm=0;const float inv_di=1.0f/d[i];for(int j=0;j<D;++j){float cpv;if(li==0)cpv=cov_prev[i*D+j];else{int pi=j<i?j:i;int pj=j<i?i:j;cpv=pp_prev[pi*D+pj]-beta_prev*uh_prev[i]*uh_prev[j];}zd+=(gCprev[i*D+j]+gCprev[j*D+i])*cpv*inv_di;}for(int c=0;c<M;++c){float mv;if(li==0)mv=mean_prev[i*M+c];else mv=mp_prev[i*M+c]+beta_prev*uh_prev[i]*eh_prev[c];zm+=gMprev[i*M+c]*mv;}gdecay[((size_t)b*t+ti)*D+i]=zd+zm;}
-     float pz=0;for(int i=tid;i<D;i+=THREADS){float inv_di=1.0f/d[i];pz+=gCprev[i*D+i]*inv_di*inv_di;}pz=warp_sum_d2(pz);if(tid==0)gprocess[(size_t)b*t+ti]=pz;
+     float pz=0;for(int i=tid;i<D;i+=THREADS){float inv_di=1.0f/d[i];pz+=gCprev[i*D+i]*inv_di*inv_di;}pz=warp_sum_d2(pz, 0xffffu << (group*16));if(tid==0)gprocess[(size_t)b*t+ti]=pz;
    }
    if constexpr (FIXED) {
      for(int x=tid;x<D*M;x+=THREADS){int i=x/M,c=x%M;gM[x]=(gM[x]-k[i]*ge[c])*0.97f;}
    } else {
      for(int x=tid;x<D*M;x+=THREADS){int i=x/M;gM[x]=gMprev[x]*d[i];}
    }
-   for(int x=tid;x<D*D;x+=THREADS)gC[x]=gCprev[x];for(int i=tid;i<D;i+=THREADS)gkeys[((size_t)b*t+ti)*D+i]=gk[i];sync_threads_d2<THREADS>();
+   for(int x=tid;x<D*D;x+=THREADS)gC[x]=gCprev[x];for(int i=tid;i<D;i+=THREADS)gkeys[((size_t)b*t+ti)*D+i]=gk[i];sync_threads_d2<THREADS>(0xffffu << (group*16));
  }
  for(int x=tid;x<D*M;x+=THREADS)gm_state[b*D*M+x]=gM[x];for(int x=tid;x<D*D;x+=THREADS)gc_state[b*D*D+x]=gC[x];
 }
@@ -342,7 +346,7 @@ std::vector<torch::Tensor> forward_chunked(
  TORCH_CHECK(keys.scalar_type()==at::kFloat && values.scalar_type()==at::kFloat && queries.scalar_type()==at::kFloat, "fused Bayesian inputs must be float32");
  TORCH_CHECK(keys.is_contiguous() && values.is_contiguous() && queries.is_contiguous() && decay.is_contiguous() && process.is_contiguous() && observation.is_contiguous() && mean0.is_contiguous() && cov0.is_contiguous(), "fused Bayesian inputs must be contiguous");
  TORCH_CHECK(chunks > 0 && keys.dim()==3 && values.dim()==3 && queries.dim()==3 && keys.size(2)==2 && values.size(2)==8 && queries.size(2)==2, "fused Bayesian kernel expects [N,T,8] tensors");
- int n=keys.size(0),t=keys.size(1),nb=(t+chunks-1)/chunks;auto out=torch::empty({n,t,8},keys.options()),mf=torch::empty_like(mean0),cf=torch::empty_like(cov0),bm=torch::empty({n,nb+1,2,8},keys.options()),bc=torch::empty({n,nb+1,2,2},keys.options());constexpr int th=16;constexpr size_t sh=(2*8+2*4+2*2+2*8)*sizeof(float);cudaFuncSetAttribute(chunk_forward_kernel<2,8,th>,cudaFuncAttributeMaxDynamicSharedMemorySize,(int)sh);auto st=at::cuda::getCurrentCUDAStream();chunk_forward_kernel<2,8,th><<<n,th,sh,st>>>(keys.data_ptr<float>(),values.data_ptr<float>(),queries.data_ptr<float>(),decay.data_ptr<float>(),process.data_ptr<float>(),observation.data_ptr<float>(),mean0.data_ptr<float>(),cov0.data_ptr<float>(),out.data_ptr<float>(),mf.data_ptr<float>(),cf.data_ptr<float>(),bm.data_ptr<float>(),bc.data_ptr<float>(),n,t,chunks,nb,(float)floor);C10_CUDA_KERNEL_LAUNCH_CHECK();return {out,mf,cf,bm,bc};
+ int n=keys.size(0),t=keys.size(1),nb=(t+chunks-1)/chunks;auto out=torch::empty({n,t,8},keys.options()),mf=torch::empty_like(mean0),cf=torch::empty_like(cov0),bm=torch::empty({n,nb+1,2,8},keys.options()),bc=torch::empty({n,nb+1,2,2},keys.options());constexpr int th=16;constexpr int groups=2;constexpr size_t sh=groups*(2*8+2*4+2*2+2*8)*sizeof(float);cudaFuncSetAttribute(chunk_forward_kernel<2,8,th,false,groups>,cudaFuncAttributeMaxDynamicSharedMemorySize,(int)sh);auto st=at::cuda::getCurrentCUDAStream();chunk_forward_kernel<2,8,th,false,groups><<<(n+groups-1)/groups,groups*th,sh,st>>>(keys.data_ptr<float>(),values.data_ptr<float>(),queries.data_ptr<float>(),decay.data_ptr<float>(),process.data_ptr<float>(),observation.data_ptr<float>(),mean0.data_ptr<float>(),cov0.data_ptr<float>(),out.data_ptr<float>(),mf.data_ptr<float>(),cf.data_ptr<float>(),bm.data_ptr<float>(),bc.data_ptr<float>(),n,t,chunks,nb,(float)floor);C10_CUDA_KERNEL_LAUNCH_CHECK();return {out,mf,cf,bm,bc};
 }
 
 std::vector<torch::Tensor> forward_chunked_fixed(
@@ -374,18 +378,18 @@ std::vector<torch::Tensor> backward_chunked_impl(
  }
  // D2/M8's largest tile is D*M=16.  Keep one lane per tile element; a
  // full warp only repeats barriers and reductions for this narrow state.
- constexpr int th=16;
- constexpr size_t recompute_sh=(2*8+2*4+2*2+2*8)*sizeof(float);
+ constexpr int th=16; constexpr int groups=2;
+ constexpr size_t recompute_sh=groups*(2*8+2*4+2*2+2*8)*sizeof(float);
  // gM/gMprev are both present for dynamic replay; fixed replay aliases them.
- constexpr size_t backward_sh=((FIXED ? 16 : 2*16) + 2*4 + 8 + 3*2 + th)*sizeof(float);
- cudaFuncSetAttribute(recompute_chunk_kernel<2,8,th,FIXED>,cudaFuncAttributeMaxDynamicSharedMemorySize,(int)recompute_sh);
- cudaFuncSetAttribute(backward_chunk_kernel<2,8,th,NEED_DYNAMICS,FIXED>,cudaFuncAttributeMaxDynamicSharedMemorySize,(int)backward_sh);
+ constexpr size_t backward_sh=groups*((FIXED ? 16 : 2*16) + 2*4 + 8 + 3*2 + th)*sizeof(float);
+ cudaFuncSetAttribute(recompute_chunk_kernel<2,8,th,FIXED,groups>,cudaFuncAttributeMaxDynamicSharedMemorySize,(int)recompute_sh);
+ cudaFuncSetAttribute(backward_chunk_kernel<2,8,th,NEED_DYNAMICS,FIXED,groups>,cudaFuncAttributeMaxDynamicSharedMemorySize,(int)backward_sh);
  auto st=at::cuda::getCurrentCUDAStream();
  for(int ci=nb-1;ci>=0;--ci){
-   recompute_chunk_kernel<2,8,th,FIXED><<<n,th,recompute_sh,st>>>(
+   recompute_chunk_kernel<2,8,th,FIXED,groups><<<(n+groups-1)/groups,groups*th,recompute_sh,st>>>(
      keys.data_ptr<float>(),values.data_ptr<float>(),decay.data_ptr<float>(),process.data_ptr<float>(),observation.data_ptr<float>(),
      bm.data_ptr<float>(),bc.data_ptr<float>(),mp.data_ptr<float>(),pp.data_ptr<float>(),uh.data_ptr<float>(),bh.data_ptr<float>(),eh.data_ptr<float>(),n,t,chunks,nb,ci,(float)floor);
-   backward_chunk_kernel<2,8,th,NEED_DYNAMICS,FIXED><<<n,th,backward_sh,st>>>(
+   backward_chunk_kernel<2,8,th,NEED_DYNAMICS,FIXED,groups><<<(n+groups-1)/groups,groups*th,backward_sh,st>>>(
      keys.data_ptr<float>(),values.data_ptr<float>(),queries.data_ptr<float>(),decay.data_ptr<float>(),process.data_ptr<float>(),observation.data_ptr<float>(),
      mean0.data_ptr<float>(),cov0.data_ptr<float>(),bm.data_ptr<float>(),bc.data_ptr<float>(),mp.data_ptr<float>(),pp.data_ptr<float>(),uh.data_ptr<float>(),bh.data_ptr<float>(),eh.data_ptr<float>(),
      gy.data_ptr<float>(),gk.data_ptr<float>(),gv.data_ptr<float>(),gq.data_ptr<float>(),gd_ptr,gp_ptr,gr_ptr,gm.data_ptr<float>(),gc.data_ptr<float>(),n,t,chunks,nb,ci,(float)floor);
