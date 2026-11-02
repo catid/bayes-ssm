@@ -118,30 +118,29 @@ fused CUDA loader has dedicated D=4/M=8 and D=8/M=8 kernels. Use it with:
 python example/train_6layer.py --device cuda:0 --precision bf16 \
   --fused-rmsnorm --compile-components both --optimize-bayes \
   --bayes-backend fused --bayes-key-dim 4 --cuda-graph --gpu-batch-staging \
-  --width 512 --heads 64 --kv-heads 4 --mlp-width 8619 \
-  --seq 512 --batch 128 --steps 40 --warmup 5
+  --chunk-length 512 --width 512 --heads 64 --kv-heads 4 --mlp-width 8400 \
+  --seq 512 --batch 128 --steps 120 --warmup 5
 ```
 
 This is a single-GB300 measurement of the complete forward, backward, gradient
 clip, and AdamW step. The Mamba-3 row uses the same batch and graph settings,
-with the parameter-matched 8,403-wide MLP:
+with the same 8,400-wide MLP and whole-sequence replay setting:
 
 | Model | Parameters | Bayesian state | Batch × sequence | Throughput | Peak allocated VRAM | Validation loss |
 |---|---:|---:|---:|---:|---:|---:|
-| Bayesian fused | 101.936M | D=4, M=8 | 128 × 512 | **434,185 tok/s** | 60,197 MiB | 10.4264 |
-| Bayesian fused | 101.942M | D=8, M=8 | 128 × 512 | 394,081 tok/s | 62,427 MiB | — |
-| Mamba-3 matched hybrid | 101.944M | — | 128 × 512 | **660,341 tok/s** | 60,093 MiB | 10.4612 |
+| Bayesian fused, parameter-matched | 101.982M | D=4, M=8 | 128 × 512 | **700,753 tok/s** | 62,356 MiB | 10.3846 |
+| Bayesian fused, lower-parameter width | 99.918M | D=4, M=8 | 128 × 512 | 693,666 tok/s | 61,751 MiB | 10.3860 |
+| Bayesian fused | 101.500M | D=8, M=8 | 128 × 512 | **589,160 tok/s** | 63,922 MiB | 10.3855 |
+| Mamba-3 matched hybrid | 101.916M | — | 128 × 512 | **756,009 tok/s** | 63,415 MiB | 10.3664 |
 
-The mixed-width kernel is 10.2% faster and uses 3.6% less allocated memory than
-the D=8 Bayesian path, and its recurrence-only benchmark is 29.6% faster. It
-does not yet beat Mamba-3 end to end: at this matched single-GPU shape it is
-1.52× slower. Dense covariance has quadratic state cost, so preserving the
-paper's full covariance and input-dependent dynamics imposes a real lower
-bound; claiming a Mamba-3 speedup would require either a faster kernel for the
-remaining projections/FFNs or a smaller state width. The raw records are
-[Bayesian D4/M8](example/results/gb300_6layer_bayes_paper_d4m8_fused_single.json),
-[Bayesian D8/M8](example/results/gb300_6layer_bayes_paper_d8_fused.json), and
-[Mamba-3](example/results/gb300_6layer_mamba3_paper_match_single_b128.json).
+Whole-sequence replay raises parameter-matched D=4/M=8 to 700,753 tok/s and
+D=8/M=8 to 589,160 tok/s. D=4 is now within 7.3% of the fresh Mamba-3 baseline, while
+D=8 is 22.1% slower. These rows retain the full paper feature set; D=2 remains
+the fastest configuration. Dense covariance still has quadratic state cost, so
+the wider Bayesian rows have a different state capacity from Mamba-3's
+128-dimensional SSM state. The raw records are [Bayesian D4/M8](example/results/gb300_6layer_bayes_d4_chunk512_120.json),
+[Bayesian D8/M8](example/results/gb300_6layer_bayes_d8_chunk512_120.json), and
+[Mamba-3](example/results/gb300_6layer_mamba3_recheck_no_clone120.json).
 
 An earlier D=2/M=8 TE FP8 measurement, before the final projection-side
 optimizations below, reached
