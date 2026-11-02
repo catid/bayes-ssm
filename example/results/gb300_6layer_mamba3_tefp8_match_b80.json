@@ -22,7 +22,7 @@
   },
   "world_size": 1,
   "rank": 0,
-  "precision": "BF16 projections + TransformerEngine fused RMSNorm with FP32 tied vocabulary head",
+  "precision": "TransformerEngine FP8 projections + fused RMSNorm with FP32 tied vocabulary head",
   "optimizer": "capturable fused AdamW",
   "cuda_graph": true,
   "gpu_batch_staging": true,
