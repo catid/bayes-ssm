@@ -267,13 +267,14 @@ dynamic forward-plus-backward benchmark moved from 69.60 ms to 65.26 ms at
 single-sequence implementations and agree to roundoff (the D8 grouped path
 was bitwise identical in the direct comparison).
 
-The reverse kernels also preserve the full covariance input gradient.  The
-`u kᵀ` contribution is intentionally kept row-wise before the transition
-scaling; mirroring it would silently remove valid derivatives for a learned
-initial covariance.  D2, D4, and D8 parity checks against the dense reference
-include this gradient and remain within approximately `1e-5` in FP32.  The
-fixed-dynamics Python reference explicitly symmetrizes its covariance state so
-its initial-state gradient follows the same graph as the fixed CUDA kernel.
+The production CUDA reverse kernels preserve the row-wise `u kᵀ` contribution
+through the transition scaling; mirroring it would silently remove valid
+ derivatives.  Their validated contract is the readout-only training boundary,
+where the initial mean and covariance are constants and learned transition,
+process-noise, and observation-noise gradients remain enabled.  If a caller
+requests gradients through an initial mean or covariance, the public API uses
+the dense reference path so arbitrary covariance parameterizations retain exact
+PyTorch derivatives.  This fallback is outside the timed language-model path.
 
 The paper's damped rotational variant is available with
 `--bayes-dynamics rotation`. It embeds each scalar Q/K component as
