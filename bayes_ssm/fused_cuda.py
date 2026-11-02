@@ -311,6 +311,10 @@ class _ChunkedBayesianFunction(torch.autograd.Function):
             grad_output, grad_mean, grad_covariance, ctx.chunk_length,
             ctx.denominator_floor,
         )
+        if ctx.noinitial_backward:
+            # Six differentiable tensor inputs plus five non-differentiable
+            # slots (initial mean/covariance and three scalar metadata).
+            return (*gradients, None, None, None, None, None)
         # 8 tensor gradients + 3 non-differentiable inputs.
         return (*gradients, None, None, None)
 
