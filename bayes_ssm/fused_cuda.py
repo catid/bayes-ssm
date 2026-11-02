@@ -283,7 +283,7 @@ class _ChunkedBayesianFunction(torch.autograd.Function):
             # values, queries, decay, process, observation); the regular full
             # ABI returns two additional initial-state gradients.
             if ctx.noinitial_backward:
-                return (*gradients, None, None, None, None)
+                return (*gradients, None, None, None, None, None)
             return (*gradients, None, None, None)
         if lean_backward:
             # The CUDA lean entry points still keep the full ABI: they accept
