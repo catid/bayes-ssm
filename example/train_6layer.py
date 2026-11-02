@@ -161,6 +161,7 @@ class BayesianMixer(nn.Module):
         fuse_gate_projection: bool = False,
         fuse_paper_qkv: bool = True,
         fuse_paper_projection: bool = True,
+        fuse_te_aux_projection: bool = False,
     ) -> None:
         super().__init__()
         if width % heads:
@@ -199,7 +200,8 @@ class BayesianMixer(nn.Module):
         # boundary.  BF16/FP32 use the fused projection.
         te_active = getattr(factory, "te", None) is not None
         self.fuse_paper_projection = bool(
-            fuse_paper_projection and self.fuse_paper_qkv and not te_active
+            fuse_paper_projection and self.fuse_paper_qkv
+            and (not te_active or fuse_te_aux_projection)
         )
         # The per-head read gate consumes the same normalized stream as the
         # Bayesian projections.  When explicitly requested, append it to the
@@ -632,6 +634,7 @@ class HybridBlock(nn.Module):
         fuse_gate_projection: bool = False,
         fuse_paper_qkv: bool = True,
         fuse_paper_projection: bool = True,
+        fuse_te_aux_projection: bool = False,
     ) -> None:
         super().__init__()
         self.kind = kind
@@ -643,6 +646,7 @@ class HybridBlock(nn.Module):
                 fuse_gate_projection=fuse_gate_projection,
                 fuse_paper_qkv=fuse_paper_qkv,
                 fuse_paper_projection=fuse_paper_projection,
+                fuse_te_aux_projection=fuse_te_aux_projection,
             )
         elif kind == "fa":
             self.mixer = GQAAttention(width, heads, kv_heads, factory)
@@ -677,6 +681,7 @@ class SixLayerLM(nn.Module):
         fuse_gate_projection: bool = False,
         fuse_paper_qkv: bool = True,
         fuse_paper_projection: bool = True,
+        fuse_te_aux_projection: bool = False,
     ) -> None:
         super().__init__()
         self.vocab_size = vocab_size
@@ -692,6 +697,7 @@ class SixLayerLM(nn.Module):
                 fuse_gate_projection=fuse_gate_projection,
                 fuse_paper_qkv=fuse_paper_qkv,
                 fuse_paper_projection=fuse_paper_projection,
+                fuse_te_aux_projection=fuse_te_aux_projection,
             )
             for kind in self.block_kinds
         )
@@ -849,6 +855,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         fuse_gate_projection=args.fuse_gate_projection,
         fuse_paper_qkv=args.fuse_paper_qkv,
         fuse_paper_projection=args.fuse_paper_projection,
+        fuse_te_aux_projection=args.fuse_te_aux_projection,
     ).to(device)
     # Compile the dense attention and SwiGLU components independently.  This
     # preserves the custom Bayesian recurrence boundary while fusing the
@@ -1061,6 +1068,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         "bayes_key_dim": args.bayes_key_dim,
         "bayes_key_dim_effective": effective_bayes_key_dim,
         "fuse_gate_projection": bool(args.fuse_gate_projection),
+        "fuse_te_aux_projection": bool(args.fuse_te_aux_projection),
         "bayes_features": args.bayes_features,
         "fuse_paper_qkv": bool(args.fuse_paper_qkv),
         "fuse_paper_projection": bool(args.fuse_paper_projection),
@@ -1133,6 +1141,8 @@ def main() -> None:
                         help="per-head Bayesian key/state dimension (default: head width; e.g. 4 with value width 8)")
     parser.add_argument("--fuse-bayes-gate", dest="fuse_gate_projection", action="store_true",
                         help="append the Bayesian read gate to the Q/K/V projection GEMM (experimental)")
+    parser.add_argument("--fuse-te-aux-projection", dest="fuse_te_aux_projection", action="store_true",
+                        help="opt into a shared TE FP8 scale for Q/K/V plus decay/noise (stability/perf tradeoff)")
     parser.add_argument("--seq", type=int, default=512)
     parser.add_argument("--batch", type=int, default=1)
     parser.add_argument("--steps", type=int, default=20)
