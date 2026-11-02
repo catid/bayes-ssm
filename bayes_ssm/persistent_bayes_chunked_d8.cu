@@ -218,7 +218,7 @@ __global__ void chunk_forward_kernel(
    }
    __syncthreads();
    if(tid==0){float z=rv;for(int i=0;i<D;++i)z+=k[i]*u[i];si[0]=fmaxf(z,floor);} 
-   for(int c=tid;c<M;c+=THREADS){float z=0;for(int i=0;i<D;++i)z+=(FIXED?0.97f:d[i])*mean[i*M+c]*k[i];err[c]=v[c]-z;} __syncthreads();float beta=1.f/si[0];
+   for(int c=tid;c<M;c+=THREADS){float z=0;for(int i=0;i<D;++i){if constexpr (FIXED) z+=0.97f*mean[i*M+c]*k[i]; else z+=mean[i*M+c]*wk[i];}err[c]=v[c]-z;} __syncthreads();float beta=1.f/si[0];
    for(int x=tid;x<D*M;x+=THREADS){int i=x/M,c=x%M;mean[x]=(FIXED?0.97f:d[i])*mean[x]+beta*u[i]*err[c];}
    __syncthreads();
    if constexpr (FIXED) {
@@ -285,7 +285,7 @@ __global__ void recompute_chunk_kernel(
        u[i]=d[i]*z + pv*k[i];
      }
    }
-   __syncthreads();if(tid==0){float z=rv;for(int i=0;i<D;++i)z+=k[i]*u[i];si[0]=fmaxf(z,floor);}for(int c=tid;c<M;c+=THREADS){float z=0;for(int i=0;i<D;++i)z+=(FIXED?0.97f:d[i])*mean[i*M+c]*k[i];err[c]=v[c]-z;}__syncthreads();float beta=1.f/si[0];
+   __syncthreads();if(tid==0){float z=rv;for(int i=0;i<D;++i)z+=k[i]*u[i];si[0]=fmaxf(z,floor);}for(int c=tid;c<M;c+=THREADS){float z=0;for(int i=0;i<D;++i){if constexpr (FIXED) z+=0.97f*mean[i*M+c]*k[i]; else z+=mean[i*M+c]*wk[i];}err[c]=v[c]-z;}__syncthreads();float beta=1.f/si[0];
    for(int x=tid;x<D*M;x+=THREADS){int i=x/M,c=x%M;mp[hb*D*M+x]=(FIXED?0.97f:d[i])*mean[x];}
    if constexpr (FIXED) {
      for(int x=tid;x<D*D;x+=THREADS){int i=x/D,j=x%D;pp[hb*D*D+x]=0.9409f*cov[x]+(i==j?0.1f:0.f);}
