@@ -489,7 +489,11 @@ std::vector<torch::Tensor> backward_chunked_impl(
  // learned diagonal dynamics, process noise, observation noise, and their
  // exact gradients.  The regular global-history path remains the default.
  const char* fused_replay_env = std::getenv("BAYES_SSM_FUSED_REPLAY");
- if constexpr (!FIXED) if (chunks <= 512 && fused_replay_env && fused_replay_env[0] == '1') {
+ // Two D2/M8 replay groups use about 127 KiB at chunk=512, which exceeds
+ // the portable opt-in dynamic-shared-memory limit on some SM120/SM103
+ // deployments.  Keep the fused variant within the validated 256-token
+ // envelope; larger chunks use the regular global-history replay path.
+ if constexpr (!FIXED) if (chunks <= 256 && fused_replay_env && fused_replay_env[0] == '1') {
    constexpr int fth = 16;
    constexpr int fgroups = 2;
    // D2/M8 base workspace is 98 floats; each replay token stores 31 floats.
