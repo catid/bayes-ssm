@@ -190,7 +190,9 @@ __global__ void chunk_forward_kernel(
    if(ti>0 && (ti%chunks)==0) {int c=ti/chunks; for(int x=tid;x<D*M;x+=THREADS)bmean[(b*(nb+1)+c)*D*M+x]=mean[x];for(int x=tid;x<D*D;x+=THREADS)bcov[(b*(nb+1)+c)*D*D+x]=cov[x];}
    const float* k=keys+(b*t+ti)*D;const float* v=values+(b*t+ti)*M;const float* q=queries+(b*t+ti)*D;const float* d=decay+(b*t+ti)*D;float pv=FIXED?0.1f:process[b*t+ti],rv=FIXED?1.0f:observation[b*t+ti];
    if constexpr (!FIXED) {
-     for(int x=tid;x<D*D;x+=THREADS){int i=x/D,j=x%D;cp[x]=cov[x]*d[i]*d[j]+(i==j?pv:0.f);}
+     // Covariance is symmetric after every update.  Materialize the upper
+     // triangle and mirror it, avoiding duplicate D-by-D prediction work.
+     for(int x=tid;x<D*D;x+=THREADS){int i=x/D,j=x%D;if(i<=j){float value=cov[i*D+j]*d[i]*d[j]+(i==j?pv:0.f);cp[i*D+j]=value;cp[j*D+i]=value;}}
    }
    __syncthreads();
    if constexpr (FIXED) {
@@ -217,9 +219,7 @@ __global__ void chunk_forward_kernel(
        }
      }
    } else {
-     for(int x=tid;x<D*D;x+=THREADS){int i=x/D,j=x%D;
-       float z=cp[x]-beta*u[i]*u[j],zt=cp[j*D+i]-beta*u[j]*u[i];cov[x]=.5f*(z+zt);
-     }
+     for(int x=tid;x<D*D;x+=THREADS){int i=x/D,j=x%D;if(i<=j){float value=cp[i*D+j]-beta*u[i]*u[j];cov[i*D+j]=value;cov[j*D+i]=value;}}
    }
    __syncthreads();
    for(int c=tid;c<M;c+=THREADS){float z=0;for(int i=0;i<D;++i)z+=mean[i*M+c]*q[i];outputs[(b*t+ti)*M+c]=z;} __syncthreads();
@@ -237,7 +237,7 @@ __global__ void recompute_chunk_kernel(
  size_t bo=(size_t)b*(nb+1);for(int x=tid;x<D*M;x+=THREADS)mean[x]=bmean[bo*D*M+(size_t)ci*D*M+x];for(int x=tid;x<D*D;x+=THREADS)cov[x]=bcov[bo*D*D+(size_t)ci*D*D+x];__syncthreads();
  int start=ci*chunks,len=min(chunks,t-start);for(int li=0;li<len;++li){int ti=start+li;size_t hb=(size_t)b*(size_t)chunks+(size_t)li;const float*k=keys+((size_t)b*t+ti)*D;const float*v=values+((size_t)b*t+ti)*M;const float*d=decay+((size_t)b*t+ti)*D;float pv=FIXED?0.1f:process[(size_t)b*t+ti],rv=FIXED?1.0f:observation[(size_t)b*t+ti];
    if constexpr (!FIXED) {
-     for(int x=tid;x<D*D;x+=THREADS){int i=x/D,j=x%D;cp[x]=cov[x]*d[i]*d[j]+(i==j?pv:0.f);}
+     for(int x=tid;x<D*D;x+=THREADS){int i=x/D,j=x%D;if(i<=j){float value=cov[i*D+j]*d[i]*d[j]+(i==j?pv:0.f);cp[i*D+j]=value;cp[j*D+i]=value;}}
    }
    __syncthreads();
    if constexpr (FIXED) {
@@ -263,9 +263,7 @@ __global__ void recompute_chunk_kernel(
        }
      }
    } else {
-     for(int x=tid;x<D*D;x+=THREADS){int i=x/D,j=x%D;
-       float z=cp[x]-beta*u[i]*u[j],zt=cp[j*D+i]-beta*u[j]*u[i];cov[x]=.5f*(z+zt);
-     }
+     for(int x=tid;x<D*D;x+=THREADS){int i=x/D,j=x%D;if(i<=j){float value=cp[i*D+j]-beta*u[i]*u[j];cov[i*D+j]=value;cov[j*D+i]=value;}}
    }
    __syncthreads();
  }
