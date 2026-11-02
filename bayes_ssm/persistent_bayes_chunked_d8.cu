@@ -510,7 +510,12 @@ std::vector<torch::Tensor> forward_chunked(
 std::vector<torch::Tensor> forward_chunked_fixed(
  torch::Tensor keys,torch::Tensor values,torch::Tensor queries,torch::Tensor decay,torch::Tensor process,torch::Tensor observation,torch::Tensor mean0,torch::Tensor cov0,int chunks,double floor){
  TORCH_CHECK(keys.is_cuda() && values.is_cuda() && queries.is_cuda(), "fused Bayesian CUDA inputs must be CUDA tensors");
- int n=keys.size(0),t=keys.size(1),nb=(t+chunks-1)/chunks;auto out=torch::empty({n,t,8},keys.options()),mf=torch::empty_like(mean0),cf=torch::empty_like(cov0),bm=torch::empty({n,nb+1,8,8},keys.options()),bc=torch::empty({n,nb+1,8,8},keys.options());constexpr int th=256;size_t sh=(2*8*8+4*8)*sizeof(float);cudaFuncSetAttribute(chunk_forward_kernel<8,8,th,true>,cudaFuncAttributeMaxDynamicSharedMemorySize,(int)sh);auto st=at::cuda::getCurrentCUDAStream();chunk_forward_kernel<8,8,th,true><<<n,th,sh,st>>>(keys.data_ptr<float>(),values.data_ptr<float>(),queries.data_ptr<float>(),decay.data_ptr<float>(),process.data_ptr<float>(),observation.data_ptr<float>(),mean0.data_ptr<float>(),cov0.data_ptr<float>(),out.data_ptr<float>(),mf.data_ptr<float>(),cf.data_ptr<float>(),bm.data_ptr<float>(),bc.data_ptr<float>(),n,t,chunks,nb,(float)floor);C10_CUDA_KERNEL_LAUNCH_CHECK();return {out,mf,cf,bm,bc};
+ // D=8 needs at most 64 cooperating lanes for the state and covariance
+ // tiles.  The previous 256-thread launch left three quarters of the block
+ // idle for every token (all per-row/vector loops have only 8--64 elements)
+ // while still paying the same barrier cost.  Keeping 64 lanes gives the
+ // covariance loops enough lanes and improves residency on SM103.
+ int n=keys.size(0),t=keys.size(1),nb=(t+chunks-1)/chunks;auto out=torch::empty({n,t,8},keys.options()),mf=torch::empty_like(mean0),cf=torch::empty_like(cov0),bm=torch::empty({n,nb+1,8,8},keys.options()),bc=torch::empty({n,nb+1,8,8},keys.options());constexpr int th=64;size_t sh=(2*8*8+4*8)*sizeof(float);cudaFuncSetAttribute(chunk_forward_kernel<8,8,th,true>,cudaFuncAttributeMaxDynamicSharedMemorySize,(int)sh);auto st=at::cuda::getCurrentCUDAStream();chunk_forward_kernel<8,8,th,true><<<n,th,sh,st>>>(keys.data_ptr<float>(),values.data_ptr<float>(),queries.data_ptr<float>(),decay.data_ptr<float>(),process.data_ptr<float>(),observation.data_ptr<float>(),mean0.data_ptr<float>(),cov0.data_ptr<float>(),out.data_ptr<float>(),mf.data_ptr<float>(),cf.data_ptr<float>(),bm.data_ptr<float>(),bc.data_ptr<float>(),n,t,chunks,nb,(float)floor);C10_CUDA_KERNEL_LAUNCH_CHECK();return {out,mf,cf,bm,bc};
 }
 
 template<bool NEED_DYNAMICS,bool FIXED=false>
@@ -566,7 +571,10 @@ std::vector<torch::Tensor> backward_chunked_impl(
  if constexpr (NEED_DYNAMICS) {
    gd_ptr=gd.data_ptr<float>(); gp_ptr=gp.data_ptr<float>(); gr_ptr=gr.data_ptr<float>();
  }
- constexpr int th=FIXED ? 256 : 32;
+ // The D=8 state has only 64 mean/covariance entries.  A 64-thread block
+ // covers those loops and the scalar reduction; 256 threads left 75% of the
+ // block idle while paying the same barriers, reducing SM103 residency.
+ constexpr int th=FIXED ? 64 : 32;
  size_t sh=(FIXED ? 3*8*8+3*8+th : 4*8*8+3*8+th)*sizeof(float);
  // Dynamic replay no longer allocates a shared covariance-prediction tile;
  // pp is written directly to global history before the matvec.  The fixed
