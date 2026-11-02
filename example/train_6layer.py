@@ -157,6 +157,40 @@ class GQAAttention(nn.Module):
         return self.out_proj(y)
 
 
+class CausalDepthwise4(nn.Module):
+    """Length-four causal depthwise filter with a compiler-friendly path.
+
+    ``Conv1d(groups=C, padding=3)[..., :T]`` is mathematically correct, but
+    cuDNN launches a general depthwise-convolution backward for this tiny
+    filter.  Writing the four causal taps as elementwise operations lets
+    Inductor fuse the shifts, products, and their reverse pass into a small
+    SM103 kernel.  The parameter layout intentionally matches ``Conv1d``'s
+    ``[C, 1, 4]`` weight so checkpoints remain interchangeable.
+    """
+
+    def __init__(
+        self, in_channels: int, out_channels: int | None = None,
+        *, kernel_size: int = 4, groups: int | None = None,
+        bias: bool = False, dtype: torch.dtype, device: torch.device,
+    ):
+        super().__init__()
+        out_channels = in_channels if out_channels is None else out_channels
+        if out_channels != in_channels or kernel_size != 4 or groups not in (None, in_channels) or bias:
+            raise ValueError("CausalDepthwise4 requires equal channels, kernel_size=4, groups=channels, bias=False")
+        self.weight = nn.Parameter(torch.empty(in_channels, 1, 4, dtype=dtype, device=device))
+
+    def forward(self, x: Tensor) -> Tensor:
+        # x is [batch, channels, time].  Each term is the corresponding
+        # left-shifted input, with zeros before the sequence start.
+        w = self.weight[:, 0]
+        t = x.shape[-1]
+        padded = F.pad(x, (3, 0))
+        y = padded[..., :t] * w[:, 0].view(1, -1, 1)
+        y = y + padded[..., 1 : t + 1] * w[:, 1].view(1, -1, 1)
+        y = y + padded[..., 2 : t + 2] * w[:, 2].view(1, -1, 1)
+        return y + padded[..., 3 : t + 3] * w[:, 3].view(1, -1, 1)
+
+
 class BayesianMixer(nn.Module):
     def __init__(
         self,
@@ -175,6 +209,7 @@ class BayesianMixer(nn.Module):
         fuse_te_aux_projection: bool = False,
         bf16_state_projection: bool = False,
         fuse_bayes_norm_linear: bool = False,
+        fast_causal_conv: bool = False,
     ) -> None:
         super().__init__()
         if width % heads:
@@ -190,6 +225,12 @@ class BayesianMixer(nn.Module):
         self.state_width = self.heads * self.key_dim
         self.optimized = optimized
         self.chunk_length = chunk_length
+        # The elementwise four-tap implementation is intended to be fused by
+        # Inductor.  In eager mode its four multiplies are slower than cuDNN's
+        # depthwise kernel, so callers must opt into it only when compiling the
+        # Bayesian envelope (the six-layer runner does this automatically for
+        # ``--compile-components bayes/all``).
+        self._fast_causal_conv = bool(fast_causal_conv and optimized and factory.device.type == "cuda")
         if bayes_features not in {"fixed", "paper"}:
             raise ValueError("bayes_features must be 'fixed' or 'paper'")
         if bayes_dynamics not in {"learned", "identity", "rotation"}:
@@ -294,26 +335,32 @@ class BayesianMixer(nn.Module):
                         torch.zeros(self.aux_width, dtype=factory.dtype,
                                     device=self.qkv_proj.weight.device)
                     )
-                self.qkv_conv = nn.Conv1d(
-                    2 * self.state_width + width, 2 * self.state_width + width, kernel_size=4,
-                    groups=2 * self.state_width + width, bias=False, dtype=factory.dtype,
+                conv_channels = 2 * self.state_width + width
+                self.qkv_conv = (
+                    CausalDepthwise4(conv_channels, dtype=factory.dtype, device=factory.device)
+                    if self._fast_causal_conv else
+                    nn.Conv1d(
+                        conv_channels, conv_channels, kernel_size=4,
+                        groups=conv_channels, bias=False, dtype=factory.dtype,
+                    )
                 )
                 nn.init.zeros_(self.qkv_conv.weight)
                 with torch.no_grad():
                     self.qkv_conv.weight[:, 0, -1] = 1
             else:
                 qk_width = self.state_width // 2 if bayes_dynamics == "rotation" else self.state_width
-                self.q_conv = nn.Conv1d(
+                conv_cls = CausalDepthwise4 if self._fast_causal_conv else nn.Conv1d
+                self.q_conv = conv_cls(
                     qk_width, qk_width, kernel_size=4, groups=qk_width, bias=False,
-                    dtype=factory.dtype,
+                    dtype=factory.dtype, device=factory.device,
                 )
-                self.k_conv = nn.Conv1d(
+                self.k_conv = conv_cls(
                     qk_width, qk_width, kernel_size=4, groups=qk_width, bias=False,
-                    dtype=factory.dtype,
+                    dtype=factory.dtype, device=factory.device,
                 )
-                self.v_conv = nn.Conv1d(
+                self.v_conv = conv_cls(
                     width, width, kernel_size=4, groups=width, bias=False,
-                    dtype=factory.dtype,
+                    dtype=factory.dtype, device=factory.device,
                 )
                 for conv in (self.q_conv, self.k_conv, self.v_conv):
                     nn.init.zeros_(conv.weight)
@@ -423,6 +470,14 @@ class BayesianMixer(nn.Module):
         # fixed-shape training step capturable by torch.cuda.CUDAGraph.
         self.register_buffer("process_variance", torch.tensor(0.1), persistent=False)
         self.register_buffer("observation_variance", torch.tensor(1.0), persistent=False)
+
+    def _causal_depthwise(self, value: Tensor, conv: nn.Conv1d) -> Tensor:
+        """Apply the paper's causal depthwise length-4 filter."""
+        if isinstance(conv, CausalDepthwise4):
+            # The compiler-friendly implementation already performs the
+            # left-zero padding and returns exactly T outputs.
+            return conv(value.transpose(1, 2)).transpose(1, 2)
+        return conv(F.pad(value.transpose(1, 2), (3, 0))).transpose(1, 2)
 
     def _load_from_state_dict(
         self, state_dict, prefix, local_metadata, strict, missing_keys,
@@ -540,16 +595,14 @@ class BayesianMixer(nn.Module):
                     projected[..., self.qkv_core_width + self.aux_width :]
                     if self.fuse_gate_projection else None
                 )
-                convolved = self.qkv_conv(
-                    F.pad(qkv_projected.transpose(1, 2), (3, 0))
-                ).transpose(1, 2)
+                convolved = self._causal_depthwise(qkv_projected, self.qkv_conv)
                 q_input, k_input, v_input = convolved.split(
                     (self.state_width, self.state_width, self.width), dim=-1
                 )
             else:
                 projected = (self.q_proj(z), self.k_proj(z), self.v_proj(z))
                 q_input, k_input, v_input = tuple(
-                    conv(F.pad(value.transpose(1, 2), (3, 0))).transpose(1, 2)
+                    self._causal_depthwise(value, conv)
                     for value, conv in zip(
                         projected, (self.q_conv, self.k_conv, self.v_conv), strict=True
                     )
@@ -710,6 +763,7 @@ class HybridBlock(nn.Module):
         fuse_te_aux_projection: bool = False,
         bf16_state_projection: bool = False,
         fuse_bayes_norm_linear: bool = False,
+        fast_causal_conv: bool = False,
     ) -> None:
         super().__init__()
         self.kind = kind
@@ -724,6 +778,7 @@ class HybridBlock(nn.Module):
                 fuse_te_aux_projection=fuse_te_aux_projection,
                 bf16_state_projection=bf16_state_projection,
                 fuse_bayes_norm_linear=fuse_bayes_norm_linear,
+                fast_causal_conv=fast_causal_conv,
             )
         elif kind == "fa":
             self.mixer = GQAAttention(width, heads, kv_heads, factory)
@@ -761,6 +816,7 @@ class SixLayerLM(nn.Module):
         fuse_te_aux_projection: bool = False,
         bf16_state_projection: bool = False,
         fuse_bayes_norm_linear: bool = False,
+        fast_causal_conv: bool = False,
     ) -> None:
         super().__init__()
         self.vocab_size = vocab_size
@@ -779,6 +835,7 @@ class SixLayerLM(nn.Module):
                 fuse_te_aux_projection=fuse_te_aux_projection,
                 bf16_state_projection=bf16_state_projection,
                 fuse_bayes_norm_linear=fuse_bayes_norm_linear,
+                fast_causal_conv=fast_causal_conv,
             )
             for kind in self.block_kinds
         )
@@ -939,6 +996,11 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         fuse_te_aux_projection=args.fuse_te_aux_projection,
         bf16_state_projection=args.bf16_state_projection,
         fuse_bayes_norm_linear=args.fuse_bayes_norm_linear,
+        fast_causal_conv=(
+            args.fast_causal_conv
+            if args.fast_causal_conv is not None
+            else args.compile_components in ("bayes", "all")
+        ),
     ).to(device)
     # Compile the dense attention and SwiGLU components independently.  This
     # preserves the custom Bayesian recurrence boundary while fusing the
@@ -1160,6 +1222,11 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         "fuse_te_aux_projection": bool(args.fuse_te_aux_projection),
         "bf16_state_projection": bool(args.bf16_state_projection),
         "fuse_bayes_norm_linear": bool(args.fuse_bayes_norm_linear),
+        "fast_causal_conv": bool(
+            args.fast_causal_conv
+            if args.fast_causal_conv is not None
+            else args.compile_components in ("bayes", "all")
+        ),
         "bayes_features": args.bayes_features,
         "fuse_paper_qkv": bool(args.fuse_paper_qkv),
         "fuse_paper_projection": bool(args.fuse_paper_projection),
@@ -1238,6 +1305,10 @@ def main() -> None:
                         help="run Bayesian SiLU/normalization in BF16 (native BF16 or TE FP8) and cast to FP32 at the recurrent boundary")
     parser.add_argument("--fuse-bayes-norm-linear", action="store_true",
                         help="fuse the Bayesian input RMSNorm into the TE projection (opt-in performance mode)")
+    parser.add_argument(
+        "--fast-causal-conv", action=argparse.BooleanOptionalAction, default=None,
+        help="use the Inductor-friendly four-tap causal filter; auto-enabled when compiling Bayesian mixers",
+    )
     parser.add_argument("--seq", type=int, default=512)
     parser.add_argument("--batch", type=int, default=1)
     parser.add_argument("--steps", type=int, default=20)

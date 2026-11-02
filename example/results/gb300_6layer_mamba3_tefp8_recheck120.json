@@ -1,0 +1,31 @@
+{
+  "schema": "bayes-ssm-six-layer-mamba3-hybrid-v3",
+  "device": "NVIDIA GB300",
+  "model": {
+    "layers": ["mamba3-siso", "mamba3-siso", "gqa", "mamba3-siso", "mamba3-siso", "gqa"],
+    "parameters": 101916288,
+    "width": 512,
+    "heads": 64,
+    "kv_heads": 4,
+    "mlp_width": 8400,
+    "vocab_size": 32000,
+    "sequence_length": 512,
+    "batch_per_rank": 128
+  },
+  "world_size": 1,
+  "rank": 0,
+  "precision": "TE FP8 projections + TransformerEngine fused RMSNorm with FP32 tied vocabulary head",
+  "optimizer": "capturable fused AdamW",
+  "cuda_graph": true,
+  "gpu_batch_staging": true,
+  "compile_ffn": true,
+  "timed_steps": 120,
+  "warmup_steps": 5,
+  "throughput_tokens_per_second": 756704.8040996525,
+  "elapsed_seconds": 10.392850629985332,
+  "peak_allocated_mib_per_rank": 63414.61328125,
+  "peak_reserved_mib_per_rank": 90186.0,
+  "final_train_loss": 10.365692138671875,
+  "validation_loss": 10.363290786743164,
+  "measurement": "full forward, backward, gradient clipping, and fused AdamW"
+}

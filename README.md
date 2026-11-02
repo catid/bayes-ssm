@@ -70,6 +70,33 @@ fixed-dynamics approximation. The Mamba validation used a 64-example per-GPU
 validation batch to avoid post-run memory pressure; validation is not part of
 the timed training measurement.
 
+### Latest GB300 recheck (same container and launch envelope)
+
+The table below is a fresh single-GB300 recheck with the TE FP8 container,
+CUDA graphs, staged synthetic batches, compiled projection/FFN envelopes,
+fused AdamW, and 120 timed optimizer steps. Both rows include forward,
+backward, gradient clipping, and the optimizer update. The Bayesian row keeps
+the paper's causal length-four Q/K/V filters, input-dependent diagonal
+transitions, input-dependent process and observation noise, dense covariance,
+FP32 recurrent state, and exact replay backward. `D=2, M=8` is an exact
+low-state configuration; it does not claim the same state capacity as a
+Mamba-3 mixer with `d_state=128`.
+
+| Model | Parameters | State / layout | Throughput (tok/s) | Peak allocated VRAM | Validation loss |
+|---|---:|---|---:|---:|---:|
+| Bayesian paper, D=2/M=8, compact CUDA recurrence + fused causal filter | 101.928M | Bayes, Bayes, GQA, Bayes, Bayes, GQA | **794,907** | **61,548 MiB** | 10.3843 |
+| Mamba-3 matched hybrid recheck | 101.916M | Mamba-3, Mamba-3, GQA, Mamba-3, Mamba-3, GQA | 756,705 | 63,415 MiB | 10.3633 |
+
+This is a 5.1% throughput advantage for the exact D=2 Bayesian state at this
+shape, with 3.0% less allocated VRAM. Earlier rows in this README were run
+under a different cached software state and are retained as historical records;
+do not mix them with this recheck. The compact recurrence removes the dynamic
+predicted-covariance shared-memory tile and reuses `d⊙k`; the causal filter is
+enabled automatically when the Bayesian envelope is compiled. The filter has
+the same `[channels, 1, 4]` checkpoint layout and was checked against cuDNN
+for short and long sequences. Disable it with `--no-fast-causal-conv` when
+running the mixer eagerly.
+
 ### Mixed-width exact CUDA path
 
 The full paper equations do not require the key/state width to equal the value
