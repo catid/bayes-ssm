@@ -16,33 +16,39 @@ import torch
 from torch import Tensor
 
 
-_EXTENSION = None
-_LOAD_ERROR: Optional[BaseException] = None
+_EXTENSIONS: dict[int, object] = {}
+_LOAD_ERRORS: dict[int, BaseException] = {}
 
 
-def _load_extension():
-    global _EXTENSION, _LOAD_ERROR
-    if _EXTENSION is not None:
-        return _EXTENSION
-    if _LOAD_ERROR is not None:
+def _load_extension(key_dim: int):
+    if key_dim in _EXTENSIONS:
+        return _EXTENSIONS[key_dim]
+    if key_dim in _LOAD_ERRORS:
         return None
     if os.environ.get("BAYES_SSM_DISABLE_FUSED_CUDA", "0") == "1":
         return None
     try:
         from torch.utils.cpp_extension import load
 
-        source = Path(__file__).with_name("persistent_bayes_chunked.cu")
-        _EXTENSION = load(
-            name="bayes_ssm_persistent_chunked_fixed",
+        if key_dim == 64:
+            source = Path(__file__).with_name("persistent_bayes_chunked.cu")
+        elif key_dim == 8:
+            source = Path(__file__).with_name("persistent_bayes_chunked_d8.cu")
+        elif key_dim == 4:
+            source = Path(__file__).with_name("persistent_bayes_chunked_d4m8.cu")
+        else:
+            return None
+        _EXTENSIONS[key_dim] = load(
+            name=f"bayes_ssm_persistent_chunked_d{key_dim}",
             sources=[str(source)],
             extra_cuda_cflags=["-O3"],
             with_cuda=True,
             verbose=os.environ.get("BAYES_SSM_VERBOSE_BUILD", "0") == "1",
         )
     except BaseException as exc:  # optional acceleration must not break fallback
-        _LOAD_ERROR = exc
+        _LOAD_ERRORS[key_dim] = exc
         return None
-    return _EXTENSION
+    return _EXTENSIONS[key_dim]
 
 
 class _ChunkedBayesianFunction(torch.autograd.Function):
@@ -63,7 +69,7 @@ class _ChunkedBayesianFunction(torch.autograd.Function):
         denominator_floor: float,
         fixed_dynamics: bool,
     ):
-        extension = _load_extension()
+        extension = _load_extension(keys.shape[-1])
         if extension is None:
             raise RuntimeError("the fused Bayesian CUDA extension is unavailable")
         n, t, _ = keys.shape
@@ -108,13 +114,13 @@ class _ChunkedBayesianFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output, grad_mean, grad_covariance):
-        extension = _load_extension()
-        if extension is None:  # pragma: no cover - extension loaded in forward
-            raise RuntimeError("the fused Bayesian CUDA extension is unavailable")
         (
             keys, values, queries, decay, process, observation,
             initial_mean, initial_covariance, boundary_mean, boundary_covariance,
         ) = ctx.saved_tensors
+        extension = _load_extension(keys.shape[-1])
+        if extension is None:  # pragma: no cover - extension loaded in forward
+            raise RuntimeError("the fused Bayesian CUDA extension is unavailable")
         device = keys.device
         # In the production mixer only the token readout is consumed.  The
         # recurrent final mean/covariance are returned for the public API but
@@ -189,28 +195,26 @@ def fused_diagonal_bayesian(
         or keys.ndim != 3
         or values.ndim != 3
         or queries.ndim != 3
-        or keys.shape[-1] != 64
-        or values.shape[-1] != 64
-        or queries.shape[-1] != 64
+        or keys.shape[-1] not in (4, 8, 64)
+        or (keys.shape[-1], values.shape[-1]) not in ((4, 8), (8, 8), (64, 64))
+        or queries.shape[-1] != keys.shape[-1]
         or keys.shape != queries.shape
         or values.shape[:2] != keys.shape[:2]
         or not all(x.dtype == torch.float32 for x in (
             keys, values, queries, decay, process, observation,
             initial_mean, initial_covariance,
         ))
-        or process.requires_grad
-        or observation.requires_grad
-        or initial_mean.requires_grad
-        or initial_covariance.requires_grad
     ):
         return None
-    extension = _load_extension()
+    key_dim = keys.shape[-1]
+    extension = _load_extension(key_dim)
     if extension is None:
         return None
     n, t, _ = keys.shape
-    if decay.shape != (n, t, 64) or process.shape != (n, t) or observation.shape != (n, t):
+    if decay.shape != (n, t, key_dim) or process.shape != (n, t) or observation.shape != (n, t):
         return None
-    if initial_mean.shape != (n, 64, 64) or initial_covariance.shape != (n, 64, 64):
+    value_dim = values.shape[-1]
+    if initial_mean.shape != (n, key_dim, value_dim) or initial_covariance.shape != (n, key_dim, key_dim):
         return None
     # Materialize every broadcasted or view input before both forward and
     # backward.  In particular, module decay/noise buffers usually have

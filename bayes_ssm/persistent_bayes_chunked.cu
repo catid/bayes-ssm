@@ -190,7 +190,9 @@ __global__ void chunk_forward_kernel(
    if(ti>0 && (ti%chunks)==0) {int c=ti/chunks; for(int x=tid;x<D*M;x+=THREADS)bmean[(b*(nb+1)+c)*D*M+x]=mean[x];for(int x=tid;x<D*D;x+=THREADS)bcov[(b*(nb+1)+c)*D*D+x]=cov[x];}
    const float* k=keys+(b*t+ti)*D;const float* v=values+(b*t+ti)*M;const float* q=queries+(b*t+ti)*D;const float* d=decay+(b*t+ti)*D;float pv=FIXED?0.1f:process[b*t+ti],rv=FIXED?1.0f:observation[b*t+ti];
    if constexpr (!FIXED) {
-     for(int x=tid;x<D*D;x+=THREADS){int i=x/D,j=x%D;cp[x]=cov[x]*d[i]*d[j]+(i==j?pv:0.f);}
+     // P is symmetric.  Form the upper triangle once and mirror it instead
+     // of doing two identical row/column updates for every token.
+     for(int x=tid;x<D*D;x+=THREADS){int i=x/D,j=x%D;if(j>=i){float value=cov[i*D+j]*d[i]*d[j]+(i==j?pv:0.f);cp[i*D+j]=value;cp[j*D+i]=value;}}
    }
    __syncthreads();
    if constexpr (FIXED) {
@@ -209,18 +211,21 @@ __global__ void chunk_forward_kernel(
    if constexpr (FIXED) {
      // The fixed recurrence preserves symmetry. Compute each upper-triangle
      // entry once and mirror it, halving the covariance update arithmetic.
-     int i=tid & (D-1), lane=tid >> 6;
-     // With 256 threads there are four lanes per row; stride by four so each
-     // upper-triangle entry has exactly one writer.  The old stride-2 loop
-     // made lanes 0/2 (and 1/3) race on the same covariance entries.
-     for(int j=i+lane;j<D;j+=4){
-       float value=0.9409f*cov[i*D+j]+(i==j?0.1f:0.f)-beta*u[i]*u[j];
-       cov[i*D+j]=value;cov[j*D+i]=value;
+     // Assign each upper-triangle entry to exactly one thread.  Mapping a
+     // thread to (row,lane) and starting at row+lane causes duplicate writers
+     // for off-diagonal entries (e.g. (0,1) and (1,0)); the flat mapping below
+     // avoids that race while preserving the symmetry invariant.
+     for (int flat = tid; flat < D * D; flat += THREADS) {
+       int i = flat / D, j = flat - i * D;
+       if (i <= j) {
+         float value = 0.9409f * cov[i * D + j] + (i == j ? 0.1f : 0.f)
+                     - beta * u[i] * u[j];
+         cov[i * D + j] = value;
+         cov[j * D + i] = value;
+       }
      }
    } else {
-     for(int x=tid;x<D*D;x+=THREADS){int i=x/D,j=x%D;
-       float z=cp[x]-beta*u[i]*u[j],zt=cp[j*D+i]-beta*u[j]*u[i];cov[x]=.5f*(z+zt);
-     }
+     for(int x=tid;x<D*D;x+=THREADS){int i=x/D,j=x%D;if(j>=i){float value=cp[i*D+j]-beta*u[i]*u[j];cov[i*D+j]=value;cov[j*D+i]=value;}}
    }
    __syncthreads();
    for(int c=tid;c<M;c+=THREADS){float z=0;for(int i=0;i<D;++i)z+=mean[i*M+c]*q[i];outputs[(b*t+ti)*M+c]=z;} __syncthreads();
@@ -238,7 +243,7 @@ __global__ void recompute_chunk_kernel(
  size_t bo=(size_t)b*(nb+1);for(int x=tid;x<D*M;x+=THREADS)mean[x]=bmean[bo*D*M+(size_t)ci*D*M+x];for(int x=tid;x<D*D;x+=THREADS)cov[x]=bcov[bo*D*D+(size_t)ci*D*D+x];__syncthreads();
  int start=ci*chunks,len=min(chunks,t-start);for(int li=0;li<len;++li){int ti=start+li;size_t hb=(size_t)b*(size_t)chunks+(size_t)li;const float*k=keys+((size_t)b*t+ti)*D;const float*v=values+((size_t)b*t+ti)*M;const float*d=decay+((size_t)b*t+ti)*D;float pv=FIXED?0.1f:process[(size_t)b*t+ti],rv=FIXED?1.0f:observation[(size_t)b*t+ti];
    if constexpr (!FIXED) {
-     for(int x=tid;x<D*D;x+=THREADS){int i=x/D,j=x%D;cp[x]=cov[x]*d[i]*d[j]+(i==j?pv:0.f);}
+     for(int x=tid;x<D*D;x+=THREADS){int i=x/D,j=x%D;if(j>=i){float value=cov[i*D+j]*d[i]*d[j]+(i==j?pv:0.f);cp[i*D+j]=value;cp[j*D+i]=value;}}
    }
    __syncthreads();
    if constexpr (FIXED) {
@@ -256,16 +261,17 @@ __global__ void recompute_chunk_kernel(
    for(int i=tid;i<D;i+=THREADS)uh[hb*D+i]=u[i];for(int c=tid;c<M;c+=THREADS)eh[hb*M+c]=err[c];if(tid==0)bh[hb]=beta;
    for(int x=tid;x<D*M;x+=THREADS){int i=x/M,c=x%M;mean[x]=(FIXED?0.97f:d[i])*mean[x]+beta*u[i]*err[c];}__syncthreads();
    if constexpr (FIXED) {
-     int i=tid & (D-1), lane=tid >> 6;
-     // Match the four-lane 256-thread launch; avoid duplicate writers.
-     for(int j=i+lane;j<D;j+=4){
-       float value=0.9409f*cov[i*D+j]+(i==j?0.1f:0.f)-beta*u[i]*u[j];
-       cov[i*D+j]=value;cov[j*D+i]=value;
+     for (int flat = tid; flat < D * D; flat += THREADS) {
+       int i = flat / D, j = flat - i * D;
+       if (i <= j) {
+         float value = 0.9409f * cov[i * D + j] + (i == j ? 0.1f : 0.f)
+                     - beta * u[i] * u[j];
+         cov[i * D + j] = value;
+         cov[j * D + i] = value;
+       }
      }
    } else {
-     for(int x=tid;x<D*D;x+=THREADS){int i=x/D,j=x%D;
-       float z=cp[x]-beta*u[i]*u[j],zt=cp[j*D+i]-beta*u[j]*u[i];cov[x]=.5f*(z+zt);
-     }
+     for(int x=tid;x<D*D;x+=THREADS){int i=x/D,j=x%D;if(j>=i){float value=cp[i*D+j]-beta*u[i]*u[j];cov[i*D+j]=value;cov[j*D+i]=value;}}
    }
    __syncthreads();
  }
@@ -289,7 +295,7 @@ __global__ void backward_chunk_kernel(
      for(int x=tid;x<D*M;x+=THREADS){int i=x/M,c=x%M;gMprev[x]=gM[x]-k[i]*ge[c];}
    }
    for(int i=tid;i<D;i+=THREADS){float z=0;for(int c=0;c<M;++c)z+=mp0[i*M+c]*ge[c];gk[i]=-z;}__syncthreads();
-   float z=0;for(int x=tid;x<D*D;x+=THREADS){int i=x/D,j=x%D;float r=.5f*(gC[x]+gC[j*D+i]);z-=r*u[i]*u[j];}for(int x=tid;x<D*M;x+=THREADS){int i=x/M,c=x%M;z+=gM[x]*u[i]*e[c];}red[tid]=z;__syncthreads();for(int off=THREADS/2;off>0;off>>=1){if(tid<off)red[tid]+=red[tid+off];__syncthreads();}
+   float z=0;for(int x=tid;x<D*D;x+=THREADS){int i=x/D,j=x%D;if(j>=i){float r=.5f*(gC[x]+gC[j*D+i]);z-=(i==j?r:2.f*r)*u[i]*u[j];}}for(int x=tid;x<D*M;x+=THREADS){int i=x/M,c=x%M;z+=gM[x]*u[i]*e[c];}red[tid]=z;__syncthreads();for(int off=THREADS/2;off>0;off>>=1){if(tid<off)red[tid]+=red[tid+off];__syncthreads();}
    if(tid==0){float s=rv;for(int i=0;i<D;++i)s+=k[i]*u[i];scalars[0]=red[0];scalars[1]=(s>floor)?-red[0]*beta*beta:0.f;
      if constexpr (NEED_DYNAMICS) gobservation[(size_t)b*t+ti]=scalars[1];
    }__syncthreads();float gs=scalars[1];
@@ -320,7 +326,7 @@ std::vector<torch::Tensor> forward_chunked(
  TORCH_CHECK(keys.scalar_type()==at::kFloat && values.scalar_type()==at::kFloat && queries.scalar_type()==at::kFloat, "fused Bayesian inputs must be float32");
  TORCH_CHECK(keys.is_contiguous() && values.is_contiguous() && queries.is_contiguous() && decay.is_contiguous() && process.is_contiguous() && observation.is_contiguous() && mean0.is_contiguous() && cov0.is_contiguous(), "fused Bayesian inputs must be contiguous");
  TORCH_CHECK(chunks > 0 && keys.dim()==3 && values.dim()==3 && queries.dim()==3 && keys.size(2)==64 && values.size(2)==64 && queries.size(2)==64, "fused Bayesian kernel expects [N,T,64] tensors");
- int n=keys.size(0),t=keys.size(1),nb=(t+chunks-1)/chunks;auto out=torch::empty({n,t,64},keys.options()),mf=torch::empty_like(mean0),cf=torch::empty_like(cov0),bm=torch::empty({n,nb+1,64,64},keys.options()),bc=torch::empty({n,nb+1,64,64},keys.options());constexpr int th=128;size_t sh=(3*64*64+2*64+64)*sizeof(float);cudaFuncSetAttribute(chunk_forward_kernel<64,64,th>,cudaFuncAttributeMaxDynamicSharedMemorySize,(int)sh);auto st=at::cuda::getCurrentCUDAStream();chunk_forward_kernel<64,64,th><<<n,th,sh,st>>>(keys.data_ptr<float>(),values.data_ptr<float>(),queries.data_ptr<float>(),decay.data_ptr<float>(),process.data_ptr<float>(),observation.data_ptr<float>(),mean0.data_ptr<float>(),cov0.data_ptr<float>(),out.data_ptr<float>(),mf.data_ptr<float>(),cf.data_ptr<float>(),bm.data_ptr<float>(),bc.data_ptr<float>(),n,t,chunks,nb,(float)floor);C10_CUDA_KERNEL_LAUNCH_CHECK();return {out,mf,cf,bm,bc};
+ int n=keys.size(0),t=keys.size(1),nb=(t+chunks-1)/chunks;auto out=torch::empty({n,t,64},keys.options()),mf=torch::empty_like(mean0),cf=torch::empty_like(cov0),bm=torch::empty({n,nb+1,64,64},keys.options()),bc=torch::empty({n,nb+1,64,64},keys.options());constexpr int th=256;size_t sh=(3*64*64+2*64+64)*sizeof(float);cudaFuncSetAttribute(chunk_forward_kernel<64,64,th>,cudaFuncAttributeMaxDynamicSharedMemorySize,(int)sh);auto st=at::cuda::getCurrentCUDAStream();chunk_forward_kernel<64,64,th><<<n,th,sh,st>>>(keys.data_ptr<float>(),values.data_ptr<float>(),queries.data_ptr<float>(),decay.data_ptr<float>(),process.data_ptr<float>(),observation.data_ptr<float>(),mean0.data_ptr<float>(),cov0.data_ptr<float>(),out.data_ptr<float>(),mf.data_ptr<float>(),cf.data_ptr<float>(),bm.data_ptr<float>(),bc.data_ptr<float>(),n,t,chunks,nb,(float)floor);C10_CUDA_KERNEL_LAUNCH_CHECK();return {out,mf,cf,bm,bc};
 }
 
 std::vector<torch::Tensor> forward_chunked_fixed(
@@ -350,7 +356,7 @@ std::vector<torch::Tensor> backward_chunked_impl(
  if constexpr (NEED_DYNAMICS) {
    gd_ptr=gd.data_ptr<float>(); gp_ptr=gp.data_ptr<float>(); gr_ptr=gr.data_ptr<float>();
  }
- constexpr int th=FIXED ? 256 : 128;
+ constexpr int th=256;
  size_t sh=(FIXED ? 3*64*64+3*64+th : 4*64*64+3*64+th)*sizeof(float);
  cudaFuncSetAttribute(recompute_chunk_kernel<64,64,th,FIXED>,cudaFuncAttributeMaxDynamicSharedMemorySize,(int)((FIXED ? 2*64*64+3*64 : 3*64*64+3*64)*sizeof(float)));
  cudaFuncSetAttribute(backward_chunk_kernel<64,64,th,NEED_DYNAMICS,FIXED>,cudaFuncAttributeMaxDynamicSharedMemorySize,(int)sh);

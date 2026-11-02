@@ -157,6 +157,7 @@ class BayesianMixer(nn.Module):
         chunk_length: int,
         bayes_features: str = "paper",
         bayes_dynamics: str = "learned",
+        bayes_key_dim: int | None = None,
         fuse_paper_qkv: bool = True,
         fuse_paper_projection: bool = True,
     ) -> None:
@@ -164,6 +165,14 @@ class BayesianMixer(nn.Module):
         if width % heads:
             raise ValueError("width must be divisible by heads")
         self.width, self.heads, self.head_dim = width, heads, width // heads
+        if bayes_key_dim is not None and (
+            not isinstance(bayes_key_dim, int) or isinstance(bayes_key_dim, bool)
+        ):
+            raise ValueError("bayes_key_dim must be an integer or None")
+        self.key_dim = self.head_dim if bayes_key_dim is None else bayes_key_dim
+        if self.key_dim <= 0 or self.key_dim > self.head_dim:
+            raise ValueError("bayes_key_dim must be in [1, width // heads]")
+        self.state_width = self.heads * self.key_dim
         self.optimized = optimized
         self.chunk_length = chunk_length
         if bayes_features not in {"fixed", "paper"}:
@@ -172,7 +181,7 @@ class BayesianMixer(nn.Module):
             raise ValueError("bayes_dynamics must be 'learned', 'identity', or 'rotation'")
         if bayes_dynamics == "rotation" and bayes_features != "paper":
             raise ValueError("rotation dynamics require bayes_features='paper'")
-        if bayes_dynamics == "rotation" and (self.head_dim % 2):
+        if bayes_dynamics == "rotation" and (self.key_dim % 2):
             raise ValueError("rotation dynamics require an even per-head dimension")
         self.bayes_features = bayes_features
         self.bayes_dynamics = bayes_dynamics
@@ -208,9 +217,9 @@ class BayesianMixer(nn.Module):
                 # block while retaining the exact paper equations.  Keep the
                 # legacy three-module path available for state-dict parity and
                 # CPU/reference checks.
-                projection_width = 3 * width
+                projection_width = 2 * self.state_width + width
                 if self.fuse_paper_projection and bayes_dynamics == "learned":
-                    projection_width += width + 2 * heads
+                    projection_width += self.state_width + 2 * heads
                 self.qkv_proj = factory.linear(
                     width, projection_width,
                     # Legacy Q/K/V projections are bias-free.  Keep the
@@ -221,18 +230,18 @@ class BayesianMixer(nn.Module):
                 self.aux_bias = None
                 if self.fuse_paper_projection and bayes_dynamics == "learned":
                     self.aux_bias = nn.Parameter(
-                        torch.zeros(width + 2 * heads, dtype=factory.dtype,
+                        torch.zeros(self.state_width + 2 * heads, dtype=factory.dtype,
                                     device=self.qkv_proj.weight.device)
                     )
                 self.qkv_conv = nn.Conv1d(
-                    3 * width, 3 * width, kernel_size=4,
-                    groups=3 * width, bias=False, dtype=factory.dtype,
+                    2 * self.state_width + width, 2 * self.state_width + width, kernel_size=4,
+                    groups=2 * self.state_width + width, bias=False, dtype=factory.dtype,
                 )
                 nn.init.zeros_(self.qkv_conv.weight)
                 with torch.no_grad():
                     self.qkv_conv.weight[:, 0, -1] = 1
             else:
-                qk_width = width // 2 if bayes_dynamics == "rotation" else width
+                qk_width = self.state_width // 2 if bayes_dynamics == "rotation" else self.state_width
                 self.q_conv = nn.Conv1d(
                     qk_width, qk_width, kernel_size=4, groups=qk_width, bias=False,
                     dtype=factory.dtype,
@@ -259,19 +268,19 @@ class BayesianMixer(nn.Module):
                 # uses the same bounded exp(-softplus(.)) parameterization as
                 # diagonal dynamics; zero angle initializes to a diagonal
                 # positive transition while retaining learnable rotations.
-                self.rotation_proj = factory.linear(width, width, bias=True)
+                self.rotation_proj = factory.linear(width, self.state_width, bias=True)
                 nn.init.zeros_(self.rotation_proj.weight)
                 nn.init.zeros_(self.rotation_proj.bias)
                 half_lives = torch.logspace(
-                    math.log10(32.0), math.log10(4096.0), width // 2,
+                    math.log10(32.0), math.log10(4096.0), self.state_width // 2,
                     device=self.norm.weight.device, dtype=torch.float32,
                 )
                 raw = torch.log(torch.expm1(math.log(2.0) / half_lives))
                 rotation_bias = self.rotation_proj.bias.data.view(
-                    self.heads, 2, self.head_dim // 2
+                    self.heads, 2, self.key_dim // 2
                 )
                 rotation_bias[:, 0, :].copy_(raw.to(rotation_bias.dtype).view(
-                    self.heads, self.head_dim // 2
+                    self.heads, self.key_dim // 2
                 ))
                 self.decay_proj = None
                 self.noise_proj = factory.linear(width, 2 * heads, bias=True)
@@ -284,7 +293,7 @@ class BayesianMixer(nn.Module):
                 # per-coordinate half-lives over the paper's 32..4096-token
                 # range, then let the input projection modulate them.
                 half_lives = torch.logspace(
-                    math.log10(32.0), math.log10(4096.0), width,
+                    math.log10(32.0), math.log10(4096.0), self.state_width,
                     # Use the mixer device for both the fused and legacy
                     # projection layouts.  The unfused reference path does
                     # not create ``qkv_proj`` and must still be constructible
@@ -305,14 +314,14 @@ class BayesianMixer(nn.Module):
                     # Standalone noise/decay projections are zero initialized;
                     # preserve that stable paper initialization in the fused
                     # rows while retaining their learned gradients.
-                    self.qkv_proj.weight.data[3 * width :].zero_()
-                    aux_bias.data[:width].copy_(raw.to(aux_bias.dtype))
-                    aux_bias.data[width : width + 2 * heads : 2].fill_(math.log(math.expm1(0.1)))
-                    aux_bias.data[width + 1 : width + 2 * heads : 2].fill_(math.log(math.expm1(1.0)))
+                    self.qkv_proj.weight.data[2 * self.state_width + width :].zero_()
+                    aux_bias.data[:self.state_width].copy_(raw.to(aux_bias.dtype))
+                    aux_bias.data[self.state_width : self.state_width + 2 * heads : 2].fill_(math.log(math.expm1(0.1)))
+                    aux_bias.data[self.state_width + 1 : self.state_width + 2 * heads : 2].fill_(math.log(math.expm1(1.0)))
                     self.decay_proj = None
                     self.noise_proj = None
                 else:
-                    self.decay_proj = factory.linear(width, width, bias=True)
+                    self.decay_proj = factory.linear(width, self.state_width, bias=True)
                     nn.init.zeros_(self.decay_proj.weight)
                     self.decay_proj.bias.data.copy_(raw.to(self.decay_proj.bias.dtype))
                     self.noise_proj = factory.linear(width, 2 * heads, bias=True)
@@ -331,7 +340,7 @@ class BayesianMixer(nn.Module):
         else:
             self.rotation_proj = None
         if bayes_features != "paper" or not self.fuse_paper_qkv:
-            qk_width = width // 2 if bayes_dynamics == "rotation" else width
+            qk_width = self.state_width // 2 if bayes_dynamics == "rotation" else self.state_width
             self.q_proj = factory.linear(width, qk_width)
             self.k_proj = factory.linear(width, qk_width)
             self.v_proj = factory.linear(width, width)
@@ -343,7 +352,7 @@ class BayesianMixer(nn.Module):
         self.g_proj = factory.linear(width, width)
         # A fixed, stable diagonal transition is the default production path;
         # covariance itself remains dense in bayesian_layer.
-        self.register_buffer("decay", torch.full((1, 1, self.head_dim), 0.97), persistent=False)
+        self.register_buffer("decay", torch.full((1, 1, self.key_dim), 0.97), persistent=False)
         # Keep scalar noise on the module device.  Besides avoiding a tiny
         # host-to-device conversion every token block, this makes the complete
         # fixed-shape training step capturable by torch.cuda.CUDAGraph.
@@ -370,6 +379,7 @@ class BayesianMixer(nn.Module):
         q_keys = tuple(prefix + f"{name}.weight" for name in ("q_proj", "k_proj", "v_proj"))
         conv_keys = tuple(prefix + f"{name}.weight" for name in ("q_conv", "k_conv", "v_conv"))
         width = self.width
+        state_width = self.state_width
         has_fused_qkv = hasattr(self, "qkv_proj")
         has_legacy_qkv = hasattr(self, "q_proj")
         if has_fused_qkv:
@@ -396,18 +406,19 @@ class BayesianMixer(nn.Module):
             qkv = state_dict.pop(qkv_key, None)
             qkv_conv = state_dict.pop(qkv_conv_key, None)
             if qkv is not None:
-                qkv_core = qkv[: 3 * width]
-                for name, rows in zip(("q_proj", "k_proj", "v_proj"), qkv_core.split(width, dim=0), strict=True):
+                qkv_core = qkv[: 2 * state_width + width]
+                q_rows, k_rows, v_rows = qkv_core.split((state_width, state_width, width), dim=0)
+                for name, rows in zip(("q_proj", "k_proj", "v_proj"), (q_rows, k_rows, v_rows), strict=True):
                     state_dict[prefix + name + ".weight"] = rows
             if qkv_conv is not None:
-                for name, rows in zip(("q_conv", "k_conv", "v_conv"), qkv_conv.split(width, dim=0), strict=True):
+                for name, rows in zip(("q_conv", "k_conv", "v_conv"), qkv_conv.split((state_width, state_width, width), dim=0), strict=True):
                     state_dict[prefix + name + ".weight"] = rows
             aux = state_dict.pop(aux_key, None)
             if aux is not None:
-                state_dict[decay_w_key] = qkv[3 * width : 4 * width]
-                state_dict[noise_w_key] = qkv[4 * width :]
-                state_dict[decay_b_key] = aux[:width]
-                state_dict[noise_b_key] = aux[width:]
+                state_dict[decay_w_key] = qkv[2 * state_width + width : 3 * state_width + width]
+                state_dict[noise_w_key] = qkv[3 * state_width + width :]
+                state_dict[decay_b_key] = aux[:state_width]
+                state_dict[noise_b_key] = aux[state_width:]
         super()._load_from_state_dict(
             state_dict, prefix, local_metadata, strict, missing_keys,
             unexpected_keys, error_msgs,
@@ -422,14 +433,17 @@ class BayesianMixer(nn.Module):
             if self.fuse_paper_qkv:
                 projected = self.qkv_proj(z)
                 if self.fuse_paper_projection and self.bayes_dynamics == "learned":
-                    qkv_projected = projected[..., : 3 * self.width]
-                    aux_projected = projected[..., 3 * self.width :] + self.aux_bias
+                    qkv_core_width = 2 * self.state_width + self.width
+                    qkv_projected = projected[..., :qkv_core_width]
+                    aux_projected = projected[..., qkv_core_width:] + self.aux_bias
                 else:
                     qkv_projected = projected
                 convolved = self.qkv_conv(
                     F.pad(qkv_projected.transpose(1, 2), (3, 0))
                 ).transpose(1, 2)
-                q_input, k_input, v_input = convolved.split(self.width, dim=-1)
+                q_input, k_input, v_input = convolved.split(
+                    (self.state_width, self.state_width, self.width), dim=-1
+                )
             else:
                 projected = (self.q_proj(z), self.k_proj(z), self.v_proj(z))
                 q_input, k_input, v_input = tuple(
@@ -448,8 +462,9 @@ class BayesianMixer(nn.Module):
         q_projected = q_input if self.bayes_features == "paper" else self.q_proj(q_input)
         k_projected = k_input if self.bayes_features == "paper" else self.k_proj(k_input)
         v_projected = v_input if self.bayes_features == "paper" else self.v_proj(v_input)
-        q = F.silu(q_projected.float()).view(b, t, self.heads, -1)
-        k = F.silu(k_projected.float()).view(b, t, self.heads, -1)
+        q_feature_dim = self.key_dim // 2 if self.bayes_dynamics == "rotation" else self.key_dim
+        q = F.silu(q_projected.float()).view(b, t, self.heads, q_feature_dim)
+        k = F.silu(k_projected.float()).view(b, t, self.heads, q_feature_dim)
         v = F.silu(v_projected.float()).view(b, t, self.heads, self.head_dim)
         q = F.normalize(q, dim=-1)
         k = F.normalize(k, dim=-1)
@@ -457,21 +472,22 @@ class BayesianMixer(nn.Module):
             # Paper embedding: each scalar key/query occupies the first
             # coordinate of a 2-D rotational state pair.
             q = torch.stack((q, torch.zeros_like(q)), dim=-1).reshape(
-                b, t, self.heads, self.head_dim
+                b, t, self.heads, self.key_dim
             ).permute(0, 2, 1, 3)
             k = torch.stack((k, torch.zeros_like(k)), dim=-1).reshape(
-                b, t, self.heads, self.head_dim
+                b, t, self.heads, self.key_dim
             ).permute(0, 2, 1, 3)
         else:
             q = q.permute(0, 2, 1, 3)
             k = k.permute(0, 2, 1, 3)
         v = v.permute(0, 2, 1, 3)
-        shape = (b * self.heads, t, self.head_dim)
-        q, k, v = (value.reshape(shape) for value in (q, k, v))
+        shape = (b * self.heads, t, self.key_dim)
+        q, k = (value.reshape(shape) for value in (q, k))
+        v = v.reshape(b * self.heads, t, self.head_dim)
         if self.bayes_features == "paper":
             if self.fuse_paper_projection and self.bayes_dynamics == "learned":
                 aux = aux_projected
-                noise = aux[..., self.width :].float().view(b, t, self.heads, 2)
+                noise = aux[..., self.state_width :].float().view(b, t, self.heads, 2)
             else:
                 noise = self.noise_proj(z).float().view(b, t, self.heads, 2)
             process = F.softplus(noise[..., 0]) + 1e-4
@@ -480,26 +496,26 @@ class BayesianMixer(nn.Module):
             observation = observation.permute(0, 2, 1).reshape(b * self.heads, t)
             if self.bayes_dynamics == "rotation":
                 process = process[..., None].expand(
-                    b * self.heads, t, self.head_dim // 2
+                    b * self.heads, t, self.key_dim // 2
                 )
-                rotation = self.rotation_proj(z).float().view(b, t, self.heads, 2, self.head_dim // 2)
+                rotation = self.rotation_proj(z).float().view(b, t, self.heads, 2, self.key_dim // 2)
                 rotation_decay = torch.exp(-F.softplus(rotation[..., 0, :]))
                 rotation_angle = rotation[..., 1, :]
-                rotation_decay = rotation_decay.reshape(b * self.heads, t, self.head_dim // 2)
-                rotation_angle = rotation_angle.reshape(b * self.heads, t, self.head_dim // 2)
+                rotation_decay = rotation_decay.reshape(b * self.heads, t, self.key_dim // 2)
+                rotation_angle = rotation_angle.reshape(b * self.heads, t, self.key_dim // 2)
                 decay = None
             elif self.decay_proj is None and not (
                 self.fuse_paper_projection and self.bayes_dynamics == "learned"
             ):
                 decay = torch.ones(
-                    b * self.heads, t, self.head_dim,
+                    b * self.heads, t, self.key_dim,
                     device=z.device, dtype=torch.float32,
                 )
             else:
                 # Paper parameterization: rho=exp(-softplus(raw)), which is
                 # stable in (0, 1] and gives usable gradients for long memory.
                 if self.fuse_paper_projection:
-                    decay_logits = aux[..., : self.width].float()
+                    decay_logits = aux[..., : self.state_width].float()
                 else:
                     decay_logits = self.decay_proj(z).float()
                 # Keep the paper parameterization exactly as written.  The
@@ -508,12 +524,12 @@ class BayesianMixer(nn.Module):
                 # updates, so use exp(-softplus(x)) for parity with the
                 # unfused/reference path.
                 decay = torch.exp(-F.softplus(decay_logits))
-                decay = decay.view(b, t, self.heads, self.head_dim)
+                decay = decay.view(b, t, self.heads, self.key_dim)
                 decay = decay.permute(0, 2, 1, 3).reshape(
-                    b * self.heads, t, self.head_dim
+                    b * self.heads, t, self.key_dim
                 )
         else:
-            decay = self.decay.expand(b * self.heads, t, self.head_dim)
+            decay = self.decay.expand(b * self.heads, t, self.key_dim)
             process = self.process_variance
             observation = self.observation_variance
         layer_kwargs = dict(
@@ -565,6 +581,7 @@ class HybridBlock(nn.Module):
         chunk_length: int,
         bayes_features: str = "paper",
         bayes_dynamics: str = "learned",
+        bayes_key_dim: int | None = None,
         fuse_paper_qkv: bool = True,
         fuse_paper_projection: bool = True,
     ) -> None:
@@ -574,6 +591,7 @@ class HybridBlock(nn.Module):
             self.mixer = BayesianMixer(
                 width, heads, factory, optimized=optimized, chunk_length=chunk_length,
                 bayes_features=bayes_features, bayes_dynamics=bayes_dynamics,
+                bayes_key_dim=bayes_key_dim,
                 fuse_paper_qkv=fuse_paper_qkv,
                 fuse_paper_projection=fuse_paper_projection,
             )
@@ -606,6 +624,7 @@ class SixLayerLM(nn.Module):
         chunk_length: int = 64,
         bayes_features: str = "paper",
         bayes_dynamics: str = "learned",
+        bayes_key_dim: int | None = None,
         fuse_paper_qkv: bool = True,
         fuse_paper_projection: bool = True,
     ) -> None:
@@ -619,6 +638,7 @@ class SixLayerLM(nn.Module):
                 kind, width, heads, kv_heads, mlp_width, factory,
                 optimized=optimized, chunk_length=chunk_length,
                 bayes_features=bayes_features, bayes_dynamics=bayes_dynamics,
+                bayes_key_dim=bayes_key_dim,
                 fuse_paper_qkv=fuse_paper_qkv,
                 fuse_paper_projection=fuse_paper_projection,
             )
@@ -774,6 +794,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         args.vocab_size, args.width, args.heads, args.kv_heads, args.mlp_width,
         factory=factory, optimized=optimized, chunk_length=args.chunk_length,
         bayes_features=args.bayes_features, bayes_dynamics=args.bayes_dynamics,
+        bayes_key_dim=args.bayes_key_dim,
         fuse_paper_qkv=args.fuse_paper_qkv,
         fuse_paper_projection=args.fuse_paper_projection,
     ).to(device)
@@ -970,6 +991,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         "heads": args.heads,
         "kv_heads": args.kv_heads,
         "mlp_width": args.mlp_width,
+        "bayes_key_dim": args.bayes_key_dim,
         "bayes_features": args.bayes_features,
         "fuse_paper_qkv": bool(args.fuse_paper_qkv),
         "fuse_paper_projection": bool(args.fuse_paper_projection),
@@ -1038,6 +1060,8 @@ def main() -> None:
     parser.add_argument("--heads", type=int, default=64)
     parser.add_argument("--kv-heads", type=int, default=4)
     parser.add_argument("--mlp-width", type=int, default=8448)
+    parser.add_argument("--bayes-key-dim", type=int, default=None,
+                        help="per-head Bayesian key/state dimension (default: head width; e.g. 4 with value width 8)")
     parser.add_argument("--seq", type=int, default=512)
     parser.add_argument("--batch", type=int, default=1)
     parser.add_argument("--steps", type=int, default=20)

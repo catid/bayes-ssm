@@ -1038,7 +1038,7 @@ def bayesian_layer(
         if (
             device.type == "cuda"
             and len(batch_shape) == 1
-            and ((d == 64 and m == 64) or (d == 8 and m == 8))
+            and ((d == 64 and m == 64) or (d == 8 and m == 8) or (d == 4 and m == 8))
             and diagonal_transition is not None
             and process_covariances is None
         ):
