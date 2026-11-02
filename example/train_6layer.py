@@ -1316,7 +1316,10 @@ def main() -> None:
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=0.1)
     parser.add_argument("--grad-clip", type=float, default=1.0)
-    parser.add_argument("--chunk-length", type=int, default=64)
+    parser.add_argument(
+        "--chunk-length", type=int, default=512,
+        help="replay chunk length (512 is faster for the full paper-feature path at seq=512; override for memory/latency tradeoffs)",
+    )
     parser.add_argument(
         "--bayes-features", choices=("fixed", "paper"), default="paper",
         help="Bayesian mixer features (default: paper; fixed is the old fast benchmark path)",
