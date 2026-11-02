@@ -2,6 +2,7 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <cuda.h>
 #include <cuda_runtime.h>
+#include <cstdlib>
 
 namespace {
 
@@ -348,8 +349,13 @@ __global__ void backward_chunk_kernel(
    // reduction reads all M columns.
    __syncthreads();
    if constexpr (NEED_DYNAMICS && !FIXED) {
-     for(int i=tid;i<D;i+=THREADS){float zd=0,zm=0;for(int j=0;j<D;++j){float cpv;if(li==0)cpv=cov_prev[i*D+j];else{float zc=pp_prev[i*D+j]-beta_prev*uh_prev[i]*uh_prev[j];cpv=.5f*(zc+(pp_prev[j*D+i]-beta_prev*uh_prev[j]*uh_prev[i]));}float gij=gCprev[i*D+j]/(d[i]*d[j]),gji=gCprev[j*D+i]/(d[j]*d[i]);zd+=gij*cpv*d[j]+gji*cpv*d[j];}for(int c=0;c<M;++c){float mv;if(li==0)mv=mean_prev[i*M+c];else mv=mp_prev[i*M+c]+beta_prev*uh_prev[i]*eh_prev[c];zm+=gMprev[i*M+c]*mv;}gdecay[((size_t)b*t+ti)*D+i]=zd+zm;}
-     float pz=0;for(int i=tid;i<D;i+=THREADS)pz+=gCprev[i*D+i]/(d[i]*d[i]);red[tid]=pz;__syncthreads();for(int off=THREADS/2;off>0;off>>=1){if(tid<off)red[tid]+=red[tid+off];__syncthreads();}if(tid==0)gprocess[(size_t)b*t+ti]=red[0];
+     // For diagonal A, dP_pred/dd_i is row/column P_prev*d_j.  Since
+     // gCprev already contains the matching d_i*d_j factor, the two terms
+     // reduce to (gC_ij + gC_ji) * P_pred_ij / d_i.  Hoisting one reciprocal
+     // per row removes two divisions per covariance entry from the reverse
+     // pass without changing the dense-covariance gradient.
+     for(int i=tid;i<D;i+=THREADS){float zd=0,zm=0;const float inv_di=1.0f/d[i];for(int j=0;j<D;++j){float cpv;if(li==0)cpv=cov_prev[i*D+j];else{float zc=pp_prev[i*D+j]-beta_prev*uh_prev[i]*uh_prev[j];cpv=.5f*(zc+(pp_prev[j*D+i]-beta_prev*uh_prev[j]*uh_prev[i]));}zd+=(gCprev[i*D+j]+gCprev[j*D+i])*cpv*inv_di;}for(int c=0;c<M;++c){float mv;if(li==0)mv=mean_prev[i*M+c];else mv=mp_prev[i*M+c]+beta_prev*uh_prev[i]*eh_prev[c];zm+=gMprev[i*M+c]*mv;}gdecay[((size_t)b*t+ti)*D+i]=zd+zm;}
+     float pz=0;for(int i=tid;i<D;i+=THREADS){float inv_di=1.0f/d[i];pz+=gCprev[i*D+i]*inv_di*inv_di;}red[tid]=pz;__syncthreads();for(int off=THREADS/2;off>0;off>>=1){if(tid<off)red[tid]+=red[tid+off];__syncthreads();}if(tid==0)gprocess[(size_t)b*t+ti]=red[0];
    }
    if constexpr (FIXED) {
      for(int x=tid;x<D*M;x+=THREADS){int i=x/M,c=x%M;gM[x]=(gM[x]-k[i]*ge[c])*0.97f;}
@@ -457,8 +463,8 @@ __global__ void fused_backward_chunk_kernel(
     if(li==0){mean_prev=bmean+((size_t)b*(nb+1)+ci)*D*M;cov_prev=bcov+((size_t)b*(nb+1)+ci)*D*D;}else{mp_prev=hmp+(size_t)(li-1)*D*M;pp_prev=hpp+(size_t)(li-1)*D*D;uh_prev=huh+(size_t)(li-1)*D;eh_prev=heh+(size_t)(li-1)*M;beta_prev=hbh[li-1];}
     __syncthreads();
     if constexpr(NEED_DYNAMICS){
-      for(int i=tid;i<D;i+=THREADS){float zd=0,zm=0;for(int j=0;j<D;++j){float cpv;if(li==0)cpv=cov_prev[i*D+j];else{float zc=pp_prev[i*D+j]-beta_prev*uh_prev[i]*uh_prev[j];cpv=.5f*(zc+(pp_prev[j*D+i]-beta_prev*uh_prev[j]*uh_prev[i]));}float gij=gCprev[i*D+j]/(d[i]*d[j]),gji=gCprev[j*D+i]/(d[j]*d[i]);zd+=gij*cpv*d[j]+gji*cpv*d[j];}for(int c=0;c<M;++c){float mv;if(li==0)mv=mean_prev[i*M+c];else mv=mp_prev[i*M+c]+beta_prev*uh_prev[i]*eh_prev[c];zm+=gMprev[i*M+c]*mv;}gdecay[((size_t)b*t+ti)*D+i]=zd+zm;}
-      float pz=0;for(int i=tid;i<D;i+=THREADS)pz+=gCprev[i*D+i]/(d[i]*d[i]);red[tid]=pz;__syncthreads();for(int off=THREADS/2;off>0;off>>=1){if(tid<off)red[tid]+=red[tid+off];__syncthreads();}if(tid==0)gprocess[(size_t)b*t+ti]=red[0];
+      for(int i=tid;i<D;i+=THREADS){float zd=0,zm=0;const float inv_di=1.0f/d[i];for(int j=0;j<D;++j){float cpv;if(li==0)cpv=cov_prev[i*D+j];else{float zc=pp_prev[i*D+j]-beta_prev*uh_prev[i]*uh_prev[j];cpv=.5f*(zc+(pp_prev[j*D+i]-beta_prev*uh_prev[j]*uh_prev[i]));}zd+=(gCprev[i*D+j]+gCprev[j*D+i])*cpv*inv_di;}for(int c=0;c<M;++c){float mv;if(li==0)mv=mean_prev[i*M+c];else mv=mp_prev[i*M+c]+beta_prev*uh_prev[i]*eh_prev[c];zm+=gMprev[i*M+c]*mv;}gdecay[((size_t)b*t+ti)*D+i]=zd+zm;}
+      float pz=0;for(int i=tid;i<D;i+=THREADS){float inv_di=1.0f/d[i];pz+=gCprev[i*D+i]*inv_di*inv_di;}red[tid]=pz;__syncthreads();for(int off=THREADS/2;off>0;off>>=1){if(tid<off)red[tid]+=red[tid+off];__syncthreads();}if(tid==0)gprocess[(size_t)b*t+ti]=red[0];
     }
     for(int x=tid;x<D*M;x+=THREADS){int i=x/M;gM[x]=gMprev[x]*d[i];}
     for(int x=tid;x<D*D;x+=THREADS)gC[x]=gCprev[x];
@@ -504,7 +510,12 @@ std::vector<torch::Tensor> backward_chunked_impl(
  // avoiding the global history tensors and the separate recompute launch.
  // Keep the existing path for unusually large chunks so dynamic shared
  // memory usage remains within the device limit.
- if constexpr (!FIXED) if (chunks <= 128) {
+ // The on-chip fused replay variant is retained as an opt-in experiment.
+ // On SM103 its larger shared history can reduce occupancy for the full
+ // dynamic backward, so the validated default remains the separate replay
+ // kernels below.  Set BAYES_SSM_FUSED_REPLAY=1 to benchmark this variant.
+ const char* fused_replay_env = std::getenv("BAYES_SSM_FUSED_REPLAY");
+ if constexpr (!FIXED) if (chunks <= 128 && fused_replay_env && fused_replay_env[0] == '1') {
    constexpr int fth = 64;
    // Match the exact pointer layout in fused_backward_chunk_kernel.  Keeping
    // this tight matters for occupancy on SM103 (the former conservative

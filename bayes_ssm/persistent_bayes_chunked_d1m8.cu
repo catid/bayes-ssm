@@ -322,8 +322,8 @@ __global__ void backward_chunk_kernel(
    // reduction reads all M columns.
    narrow_sync<THREADS>();
    if constexpr (NEED_DYNAMICS && !FIXED) {
-     for(int i=tid;i<D;i+=THREADS){float zd=0,zm=0;for(int j=0;j<D;++j){float cpv;if(li==0)cpv=cov_prev[i*D+j];else{float zc=pp_prev[i*D+j]-beta_prev*uh_prev[i]*uh_prev[j];cpv=.5f*(zc+(pp_prev[j*D+i]-beta_prev*uh_prev[j]*uh_prev[i]));}float gij=gCprev[i*D+j]/(d[i]*d[j]),gji=gCprev[j*D+i]/(d[j]*d[i]);zd+=gij*cpv*d[j]+gji*cpv*d[j];}for(int c=0;c<M;++c){float mv;if(li==0)mv=mean_prev[i*M+c];else mv=mp_prev[i*M+c]+beta_prev*uh_prev[i]*eh_prev[c];zm+=gMprev[i*M+c]*mv;}gdecay[((size_t)b*t+ti)*D+i]=zd+zm;}
-     float pz=0;for(int i=tid;i<D;i+=THREADS)pz+=gCprev[i*D+i]/(d[i]*d[i]);red[tid]=pz;narrow_sync<THREADS>();for(int off=THREADS/2;off>0;off>>=1){if(tid<off)red[tid]+=red[tid+off];narrow_sync<THREADS>();}if(tid==0)gprocess[(size_t)b*t+ti]=red[0];
+     for(int i=tid;i<D;i+=THREADS){float zd=0,zm=0;const float inv_di=1.0f/d[i];for(int j=0;j<D;++j){float cpv;if(li==0)cpv=cov_prev[i*D+j];else{float zc=pp_prev[i*D+j]-beta_prev*uh_prev[i]*uh_prev[j];cpv=.5f*(zc+(pp_prev[j*D+i]-beta_prev*uh_prev[j]*uh_prev[i]));}zd+=(gCprev[i*D+j]+gCprev[j*D+i])*cpv*inv_di;}for(int c=0;c<M;++c){float mv;if(li==0)mv=mean_prev[i*M+c];else mv=mp_prev[i*M+c]+beta_prev*uh_prev[i]*eh_prev[c];zm+=gMprev[i*M+c]*mv;}gdecay[((size_t)b*t+ti)*D+i]=zd+zm;}
+     float pz=0;for(int i=tid;i<D;i+=THREADS){float inv_di=1.0f/d[i];pz+=gCprev[i*D+i]*inv_di*inv_di;}red[tid]=pz;narrow_sync<THREADS>();for(int off=THREADS/2;off>0;off>>=1){if(tid<off)red[tid]+=red[tid+off];narrow_sync<THREADS>();}if(tid==0)gprocess[(size_t)b*t+ti]=red[0];
    }
    if constexpr (FIXED) {
      for(int x=tid;x<D*M;x+=THREADS){int i=x/M,c=x%M;gM[x]=(gM[x]-k[i]*ge[c])*0.97f;}
