@@ -82,11 +82,15 @@ class _ChunkedBayesianFunction(torch.autograd.Function):
         # reverse pass can consume these values directly and avoid launching
         # the separate recompute kernel.  All other dimensions and partial
         # chunks keep the boundary/recompute implementation.
+        # D1's scalar covariance makes a full-sequence replay cheaper than
+        # launching one recompute kernel per chunk.  The recurrence itself is
+        # chunk-independent, so use the exact full-history path for every
+        # chunk_length; callers retain identical outputs and gradients while
+        # avoiding the known multi-chunk reverse-state synchronization path.
         use_saved_history = (
             os.environ.get("BAYES_SSM_DISABLE_SAVED_HISTORY", "0") != "1"
             and not fixed_dynamics
             and keys.shape[-1] == 1
-            and int(chunk_length) >= int(t)
             and hasattr(extension, "forward_chunked_saved")
         )
         if use_saved_history:
