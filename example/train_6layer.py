@@ -222,7 +222,13 @@ class BayesianMixer(nn.Module):
         # still receives FP32 Q/K/V and all covariance arithmetic remains
         # FP32.  The opt-in flag leaves exact FP32 projection math available
         # for reference and stability comparisons.
-        self.bf16_state_projection = bool(bf16_state_projection and te_active)
+        # Native BF16 uses the same BF16 projection dtype as TE FP8's output.
+        # Keep SiLU and per-head normalization there when explicitly selected;
+        # the recurrent state boundary below still promotes to FP32, so this
+        # only removes redundant full-width conversion buffers.
+        self.bf16_state_projection = bool(
+            bf16_state_projection and (te_active or factory.dtype == torch.bfloat16)
+        )
         # The per-head read gate consumes the same normalized stream as the
         # Bayesian projections.  When explicitly requested, append it to the
         # fused GEMM so four small launches (Q/K/V and gate) become one.  The
@@ -1229,7 +1235,7 @@ def main() -> None:
     parser.add_argument("--fuse-te-aux-projection", dest="fuse_te_aux_projection", action="store_true",
                         help="opt into a shared TE FP8 scale for Q/K/V plus decay/noise (stability/perf tradeoff)")
     parser.add_argument("--bf16-state-projection", action="store_true",
-                        help="run Bayesian SiLU/normalization in BF16 and cast to FP32 at the recurrent boundary")
+                        help="run Bayesian SiLU/normalization in BF16 (native BF16 or TE FP8) and cast to FP32 at the recurrent boundary")
     parser.add_argument("--fuse-bayes-norm-linear", action="store_true",
                         help="fuse the Bayesian input RMSNorm into the TE projection (opt-in performance mode)")
     parser.add_argument("--seq", type=int, default=512)
