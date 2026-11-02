@@ -1045,6 +1045,12 @@ def bayesian_layer(
                  or (d == 1 and m == 8))
             and diagonal_transition is not None
             and process_covariances is None
+            # The specialized reverse kernels are validated for the
+            # readout-only production boundary.  When a caller asks for a
+            # gradient through the initial mean/covariance, keep the public
+            # exact API on the dense/Inductor path; this avoids assuming the
+            # covariance input is already a symmetric parameterization.
+            and not (mean.requires_grad or covariance.requires_grad)
         ):
             try:
                 from .fused_cuda import fused_diagonal_bayesian
