@@ -270,7 +270,7 @@ __global__ void recompute_chunk_kernel(
    if constexpr (!FIXED) {
      for(int x=tid;x<D*D;x+=THREADS){
        int i=x/D,j=x%D;
-       pp[hb*D*D+x] = cov[i*D+j]*d[i]*d[j] + (i==j?pv:0.f);
+       if (i <= j) pp[hb*D*D+i*D+j] = cov[i*D+j]*d[i]*d[j] + (i==j?pv:0.f);
      }
    }
    __syncthreads();
