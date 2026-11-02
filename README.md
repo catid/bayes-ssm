@@ -168,8 +168,8 @@ covariance prediction and mean innovation reuse `d * k`, covariance adjoints
 compute one symmetric triangle, and the backward decay gradient hoists the
 per-row reciprocal of the input-dependent decay.  On a GB300 with
 `N=8192, T=512, D=M=8`, full dynamic forward plus backward through all Q/K/V,
-decay, process-noise, and observation-noise inputs measured **16.02 ms →
-11.49 ms (28.2%)** over synchronized runs.  The maximum differences against
+decay, process-noise, and observation-noise inputs measured **16.05 ms →
+10.67 ms (1.50× throughput)** over 30 CUDA-event runs.  The maximum differences against
 the dense PyTorch reference were `7.2e-7` in forward outputs and `1.9e-6` in
 gradients.  Dense covariance, FP32 state, and all paper input dependencies
 remain enabled.  The experimental on-chip replay fusion is kept behind

@@ -9,10 +9,10 @@
     "FP32 recurrent state",
     "exact replay backward"
   ],
-  "measurement": "synchronized CUDA forward plus backward, 10 runs",
-  "baseline_ms": 16.093244904186577,
-  "optimized_ms": 11.492103792261332,
-  "speedup": 1.393478778036316,
+  "measurement": "CUDA-event timed forward plus backward, 30 runs after warmup",
+  "baseline_ms": 16.054767608642578,
+  "optimized_ms": 10.674864292144775,
+  "speedup": 1.503970655621856,
   "forward_max_abs_error": 7.152557373046875e-7,
   "gradient_max_abs_error": 1.9073486328125e-6,
   "notes": "Baseline is the pre-optimization D8 CUDA replay kernel. Optimized path reuses d*k in covariance prediction and mean innovation, exploits symmetric covariance adjoints, and hoists decay reciprocals in backward."
