@@ -422,12 +422,18 @@ class BayesianMixer(nn.Module):
             if qkv is not None and tuple(qkv.shape) != tuple(expected):
                 old_aux_rows = self.aux_width
                 old_rows = self.qkv_core_width + old_aux_rows
-                if tuple(qkv.shape) == (old_rows, width):
+                if self.fuse_gate_projection and tuple(qkv.shape) == (old_rows, width):
                     gate_key = prefix + "g_proj.weight"
                     gate = state_dict.pop(gate_key, None)
                     if gate is None:
                         gate = torch.zeros(width, width, dtype=qkv.dtype, device=qkv.device)
                     state_dict[qkv_key] = torch.cat((qkv, gate), dim=0)
+                elif not self.fuse_gate_projection and tuple(qkv.shape) == (
+                    old_rows + width, width
+                ):
+                    gate_key = prefix + "g_proj.weight"
+                    state_dict[qkv_key] = qkv[:old_rows]
+                    state_dict[gate_key] = qkv[old_rows:]
         elif has_legacy_qkv:
             # Fused -> legacy layout for reference modules and checkpoint
             # inspection.  Split the same rows used in the forward path.
