@@ -137,7 +137,7 @@ paper mechanisms but has lower state capacity than the default D=8 row.
 | Model | Parameters | State | Throughput | Peak allocated VRAM | Validation loss |
 |---|---:|---|---:|---:|---:|
 | Mamba-3 TE FP8 matched hybrid | 101.916M | Mamba-3 SISO + GQA | **385,083 tok/s** | 63,415 MiB | 10.3737 |
-| Bayesian TE FP8, all optimizations | 101.828M | D=1, M=8; scalar covariance/head | 366,615 tok/s | 61,225 MiB | 10.3918 |
+| Bayesian TE FP8, all optimizations | 101.828M | D=1, M=8; scalar covariance/head | **386,565 tok/s** | 62,801 MiB | 10.3891 |
 | Bayesian TE FP8, all optimizations | 101.928M | D=2, M=8; dense 2×2 covariance/head | 355,014 tok/s | 61,610 MiB | 10.3837 |
 | Bayesian TE FP8, optimized D=4 | 99.918M | D=4, M=8; dense 4×4 covariance/head | 323,185 tok/s | 62,492 MiB | 10.4752 |
 | Bayesian TE FP8, optimized D=8 | 101.500M | D=8, M=8; dense 8×8 covariance/head | 298,740 tok/s | 63,480 MiB | 10.4705 |
