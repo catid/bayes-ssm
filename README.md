@@ -84,7 +84,7 @@ Mamba-3 mixer with `d_state=128`.
 
 | Model | Parameters | State / layout | Throughput (tok/s) | Peak allocated VRAM | Validation loss |
 |---|---:|---|---:|---:|---:|
-| Bayesian paper, D=2/M=8, compact CUDA recurrence + fused causal filter | 101.928M | Bayes, Bayes, GQA, Bayes, Bayes, GQA | **794,907** | **61,548 MiB** | 10.3843 |
+| Bayesian paper, D=2/M=8, grouped CUDA replay + fused causal filter | 101.928M | Bayes, Bayes, GQA, Bayes, Bayes, GQA | **794,907** | **61,548 MiB** | 10.3843 |
 | Mamba-3 matched hybrid recheck | 101.916M | Mamba-3, Mamba-3, GQA, Mamba-3, Mamba-3, GQA | 756,705 | 63,415 MiB | 10.3633 |
 
 This is a 5.1% throughput advantage for the exact D=2 Bayesian state at this

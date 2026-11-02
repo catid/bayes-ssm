@@ -15,7 +15,7 @@
     "bayes_value_dim": 8,
     "bayes_features": "paper",
     "bayes_dynamics": "learned input-dependent diagonal",
-    "bayesian_core": "exact dense covariance; compact CUDA chunk replay"
+    "bayesian_core": "exact dense covariance; grouped CUDA chunk replay"
   },
   "world_size": 1,
   "rank": 0,
