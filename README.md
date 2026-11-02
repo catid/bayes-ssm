@@ -107,6 +107,55 @@ remaining projections/FFNs or a smaller state width. The raw records are
 [Bayesian D8/M8](example/results/gb300_6layer_bayes_paper_d8_fused.json), and
 [Mamba-3](example/results/gb300_6layer_mamba3_paper_match_single_b128.json).
 
+An earlier D=2/M=8 TE FP8 measurement, before the final projection-side
+optimizations below, reached
+628,401 tok/s at 101.928M parameters and 61,509 MiB allocated on one GB300.
+This retains a dense 2×2 covariance and all input-dependent paper features;
+the same Mamba-3 hardware run reaches 730,456 tok/s at 101.916M parameters.
+It is therefore 14% slower at this point, rather than a claimed Mamba win.
+The D=2 record is [here](example/results/gb300_6layer_bayes_d2m8_tefp8_fused_gate_single.json).
+
+### Current TE FP8 end-to-end result
+
+The fastest measured configuration keeps every paper mechanism enabled
+(learned input-dependent decay, process and observation noise, causal length-4
+Q/K/V convolutions, dense covariance, and FP32 recurrent state). It uses the
+explicit TE FP8 optimizations `--fuse-bayes-gate`,
+`--fuse-te-aux-projection`, and `--bf16-state-projection`; the last flag only
+changes SiLU and per-head normalization before the inputs are cast to the
+unchanged FP32 recurrence. A whole-sequence replay chunk removes unnecessary
+chunk launch overhead at this fixed 512-token shape.
+
+These are single-GB300, batch-128, sequence-512 CUDA-graph measurements. Each
+timed step includes forward, backward, gradient clipping, and fused AdamW. The
+Mamba row was rerun with the same graph, optimizer, data, and batch settings.
+The Bayesian D=1 row has a scalar dense covariance per head; it retains all
+paper mechanisms but has lower state capacity than the default D=8 row.
+
+| Model | Parameters | State | Throughput | Peak allocated VRAM | Validation loss |
+|---|---:|---|---:|---:|---:|
+| Bayesian TE FP8, all optimizations | 101.975M | D=1, M=8; scalar covariance/head | **752,260 tok/s** | 61,081 MiB | 10.3883 |
+| Mamba-3 TE FP8 matched hybrid | 101.916M | Mamba-3 SISO + GQA | 748,298 tok/s | 63,395 MiB | 10.3870 |
+| Bayesian TE FP8, fused auxiliary rows | 101.928M | D=2, M=8; dense 2×2 covariance/head | 638,395 tok/s | 61,049 MiB | 10.46 |
+| Bayesian TE FP8, fused gate | 101.982M | D=4, M=8; dense 4×4 covariance/head | 584,111 tok/s | 62,169 MiB | 10.474 |
+
+The D=1 run is about 0.5% faster than this Mamba run in this measurement, while
+D=2 and D=4 preserve more state capacity at a throughput cost. Run the
+fastest configuration with:
+
+```bash
+python example/train_6layer.py --device cuda:0 --precision te-fp8 \
+  --fused-rmsnorm --compile-components all --optimize-bayes \
+  --bayes-backend fused --bayes-key-dim 1 --fuse-bayes-gate \
+  --fuse-te-aux-projection --bf16-state-projection --cuda-graph \
+  --gpu-batch-staging --chunk-length 512 --width 512 --heads 64 \
+  --kv-heads 4 --mlp-width 8752 --seq 512 --batch 128 \
+  --steps 120 --warmup 5
+```
+
+The raw records are [Bayesian](example/results/gb300_6layer_bayes_d1m8_tefp8_fused_aux_bf16state_c512_single.json)
+and [Mamba-3](example/results/gb300_6layer_mamba3_tefp8_match_b80.json).
+
 Use `--bayes-backend fused` when the lower-memory custom CUDA replay path is preferred. The recorded paper-feature result uses the Inductor backend with learned input-dependent dynamics; backend rankings can change with sequence length and batch shape.
 
 The paper's damped rotational variant is available with
