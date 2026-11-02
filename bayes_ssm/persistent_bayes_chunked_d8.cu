@@ -253,7 +253,6 @@ __global__ void chunk_forward_kernel(
    if(tid==0){float z=rv;for(int i=0;i<D;++i)z+=k[i]*u[i];si[0]=fmaxf(z,floor);} 
    for(int c=tid;c<M;c+=THREADS){float z=0;for(int i=0;i<D;++i){if constexpr (FIXED) z+=0.97f*mean[i*M+c]*k[i]; else z+=mean[i*M+c]*wk[i];}err[c]=v[c]-z;} if constexpr (FIXED) __syncthreads(); else __syncwarp(group_mask);float beta=1.f/si[0];
    for(int x=tid;x<D*M;x+=THREADS){int i=x/M,c=x%M;mean[x]=(FIXED?0.97f:d[i])*mean[x]+beta*u[i]*err[c];}
-   if constexpr (FIXED) __syncthreads(); else __syncwarp(group_mask);
    if constexpr (FIXED) {
      // The fixed recurrence preserves symmetry. Compute each upper-triangle
      // entry once and mirror it, halving the covariance update arithmetic.
@@ -281,7 +280,7 @@ __global__ void chunk_forward_kernel(
      }
    }
    if constexpr (FIXED) __syncthreads(); else __syncwarp(group_mask);
-   for(int c=tid;c<M;c+=THREADS){float z=0;for(int i=0;i<D;++i)z+=mean[i*M+c]*q[i];outputs[(b*t+ti)*M+c]=z;} if constexpr (FIXED) __syncthreads(); else __syncwarp(group_mask);
+   for(int c=tid;c<M;c+=THREADS){float z=0;for(int i=0;i<D;++i)z+=mean[i*M+c]*q[i];outputs[(b*t+ti)*M+c]=z;}
  }
  for(int x=tid;x<D*M;x+=THREADS)mean_final[b*D*M+x]=mean[x];for(int x=tid;x<D*D;x+=THREADS)cov_final[b*D*D+x]=cov[x];
  for(int x=tid;x<D*M;x+=THREADS)bmean[(b*(nb+1)+nb)*D*M+x]=mean[x];for(int x=tid;x<D*D;x+=THREADS)bcov[(b*(nb+1)+nb)*D*D+x]=cov[x];
@@ -330,7 +329,7 @@ __global__ void recompute_chunk_kernel(
      // history has already been materialized.)
    }
    for(int i=tid;i<D;i+=THREADS)uh[hb*D+i]=u[i];for(int c=tid;c<M;c+=THREADS)eh[hb*M+c]=err[c];if(tid==0)bh[hb]=beta;
-   for(int x=tid;x<D*M;x+=THREADS){int i=x/M,c=x%M;mean[x]=(FIXED?0.97f:d[i])*mean[x]+beta*u[i]*err[c];}if constexpr (FIXED) __syncthreads(); else __syncwarp(group_mask);
+   for(int x=tid;x<D*M;x+=THREADS){int i=x/M,c=x%M;mean[x]=(FIXED?0.97f:d[i])*mean[x]+beta*u[i]*err[c];}
    if constexpr (FIXED) {
      for (int flat = tid; flat < D * D; flat += THREADS) {
        int i = flat / D, j = flat - i * D;
