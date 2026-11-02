@@ -340,12 +340,12 @@ __global__ void backward_chunk_kernel(
    }
    gs=__shfl_sync(0x000000ffu,gs,0);
    for(int i=tid;i<D;i+=THREADS){float a=0,bv=0;for(int c=0;c<M;++c)a+=gM[i*M+c]*e[c];for(int j=0;j<D;++j){float r=.5f*(gC[i*D+j]+gC[j*D+i]);bv+=2.f*r*u[j];}gu[i]=beta*(a-bv)+gs*k[i];gk[i]+=gs*u[i];}
-   for(int i=tid;i<D;i+=THREADS){float zz=0;for(int j=0;j<D;++j)zz+=pp0[j*D+i]*gu[j];gk[i]+=zz;}for(int x=tid;x<D*D;x+=THREADS){int i=x/D,j=x%D;float r=.5f*(gC[x]+gC[j*D+i]);
-       // P is stored as a symmetric matrix.  The u=P'k contribution must
-       // be projected onto that symmetric subspace as well; otherwise the
-       // initial-covariance gradient acquires a spurious antisymmetric part.
-       float gu_sym=0.5f*(gu[i]*k[j]+gu[j]*k[i]);
-       gCprev[x]=(r+gu_sym)*(FIXED?0.9409f:d[i]*d[j]);}
+   for(int i=tid;i<D;i+=THREADS){float zz=0;for(int j=0;j<D;++j)zz+=pp0[j*D+i]*gu[j];gk[i]+=zz;}for(int x=tid;x<D*D;x+=THREADS){int i=x/D,j=x%D;
+       // Keep the full row-wise gradient through u=P'k.  The forward state
+       // is symmetrized, but an unconstrained covariance input has valid
+       // asymmetric derivatives that must not be mirrored away.
+       float r=.5f*(gC[x]+gC[j*D+i]);
+       gCprev[x]=(r+gu[i]*k[j])*(FIXED?0.9409f:d[i]*d[j]);}
    const float*mean_prev;const float*cov_prev;float beta_prev=0;const float*mp_prev=nullptr;const float*uh_prev=nullptr;const float*eh_prev=nullptr;const float*pp_prev=nullptr; if(li==0){mean_prev=bmean+((size_t)b*(nb+1)+ci)*D*M;cov_prev=bcov+((size_t)b*(nb+1)+ci)*D*D;}else{size_t hp=(size_t)b*chunks+(size_t)(li-1);mp_prev=mp+hp*D*M;uh_prev=uh+hp*D;eh_prev=eh+hp*M;pp_prev=pp+hp*D*D;beta_prev=bh[hp];}
    // gMprev is produced cooperatively above; wait before the per-row decay
    // reduction reads all M columns.
@@ -395,7 +395,10 @@ std::vector<torch::Tensor> forward_chunked_saved(
  auto bm=torch::empty({n,nb+1,1,8},keys.options()),bc=torch::empty({n,nb+1,1,1},keys.options());
  auto mp=torch::empty({n,t,1,8},keys.options()),pp=torch::empty({n,t,1,1},keys.options());
  auto uh=torch::empty({n,t,1},keys.options()),bh=torch::empty({n,t},keys.options()),eh=torch::empty({n,t,8},keys.options());
- constexpr int th=8; constexpr int groups=2;
+ // D1/M8 uses one eight-lane group per sequence.  Four groups fit in a
+ // 32-thread warp-sized block and improve residency for the scalar recurrence
+ // without changing any arithmetic or synchronization masks.
+ constexpr int th=8; constexpr int groups=4;
  constexpr size_t sh=groups*(8+1+1+1+8+1)*sizeof(float);
  cudaFuncSetAttribute(chunk_forward_kernel<1,8,th,false,groups>,cudaFuncAttributeMaxDynamicSharedMemorySize,(int)sh);
  auto st=at::cuda::getCurrentCUDAStream();
@@ -611,7 +614,10 @@ std::vector<torch::Tensor> backward_chunked_saved_d1(
   auto gd=torch::zeros_like(decay),gp=torch::zeros_like(process),gr=torch::zeros_like(observation);
   auto gm=gmf.contiguous().clone(),gc=gcf.contiguous().clone();
   auto st=at::cuda::getCurrentCUDAStream();
-  constexpr int groups=2;
+  // Keep four independent eight-lane sequences resident in each block.  The
+  // masked shuffles make groups independent, so this is an occupancy-only
+  // change with identical forward and reverse arithmetic.
+  constexpr int groups=4;
   backward_saved_d1_dynamic_kernel<groups><<<(n+groups-1)/groups,groups*8,0,st>>>(
    keys.data_ptr<float>(),values.data_ptr<float>(),queries.data_ptr<float>(),decay.data_ptr<float>(),
    process.data_ptr<float>(),observation.data_ptr<float>(),bm.data_ptr<float>(),bc.data_ptr<float>(),
