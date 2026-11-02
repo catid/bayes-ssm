@@ -89,8 +89,9 @@ __global__ void bayes_kernel(
     if (mp_hist) {
       for (int x = tid; x < D * M; x += THREADS) {
         mp_hist[hbase * D * M + x] = d[x / M] * mean[x];
-        e_hist[hbase * M + (x % M)] = si[x % M];
       }
+      for (int c = tid; c < M; c += THREADS)
+        e_hist[hbase * M + c] = si[c];
       for (int x = tid; x < D * D; x += THREADS)
         pp_hist[hbase * D * D + x] = cov_pred[x];
       for (int i = tid; i < D; i += THREADS) u_hist[hbase * D + i] = tmp[i];
