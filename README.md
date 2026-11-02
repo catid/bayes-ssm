@@ -127,25 +127,29 @@ changes SiLU and per-head normalization before the inputs are cast to the
 unchanged FP32 recurrence. A whole-sequence replay chunk removes unnecessary
 chunk launch overhead at this fixed 512-token shape.
 
-These are single-GB300, batch-128, sequence-512 CUDA-graph measurements. Each
-timed step includes forward, backward, gradient clipping, and fused AdamW. The
-Mamba row was rerun with the same graph, optimizer, data, and batch settings.
+These are single-GB300, batch-128, sequence-512 CUDA-graph measurements in the
+current PyTorch 2.14.1/TransformerEngine 2.18 runtime. Each timed step includes
+forward, backward, gradient clipping, and fused AdamW. The Mamba row was rerun
+with the same graph, optimizer, data, and batch settings.
 The Bayesian D=1 row has a scalar dense covariance per head; it retains all
 paper mechanisms but has lower state capacity than the default D=8 row.
 
 | Model | Parameters | State | Throughput | Peak allocated VRAM | Validation loss |
 |---|---:|---|---:|---:|---:|
-| Bayesian TE FP8, all optimizations | 101.828M | D=1, M=8; scalar covariance/head | **758,504 tok/s** | 61,032 MiB | 10.3889 |
-| Mamba-3 TE FP8 matched hybrid | 101.916M | Mamba-3 SISO + GQA | 756,067 tok/s | 63,415 MiB | 10.3790 |
-| Bayesian TE FP8, fused auxiliary rows | 101.928M | D=2, M=8; dense 2×2 covariance/head | 638,395 tok/s | 61,049 MiB | 10.46 |
-| Bayesian TE FP8, fused gate | 101.982M | D=4, M=8; dense 4×4 covariance/head | 584,111 tok/s | 62,169 MiB | 10.474 |
+| Mamba-3 TE FP8 matched hybrid | 101.916M | Mamba-3 SISO + GQA | **385,083 tok/s** | 63,415 MiB | 10.3737 |
+| Bayesian TE FP8, all optimizations | 101.828M | D=1, M=8; scalar covariance/head | 366,615 tok/s | 61,225 MiB | 10.3918 |
+| Bayesian TE FP8, all optimizations | 101.928M | D=2, M=8; dense 2×2 covariance/head | 355,014 tok/s | 61,610 MiB | 10.3837 |
+| Bayesian TE FP8, optimized D=4 | 99.918M | D=4, M=8; dense 4×4 covariance/head | 323,185 tok/s | 62,492 MiB | 10.4752 |
+| Bayesian TE FP8, optimized D=8 | 101.500M | D=8, M=8; dense 8×8 covariance/head | 298,740 tok/s | 63,480 MiB | 10.4705 |
 
-The D=1 run is 0.32% faster than this Mamba run in this measurement. It uses the optional TE `LayerNormLinear` fusion. Its
-parameter count is 0.087% lower because TE requires the MLP output dimension
-to be a multiple of 16; `--mlp-width 8736` is the nearest valid width to the
-101.916M Mamba configuration. D=2 and D=4 preserve more state capacity at a
-throughput cost. Run the
-fastest configuration with:
+The D=1 run is 4.8% slower than Mamba-3 in this current runtime, while retaining
+the full paper feature set. Its parameter count is 0.087% lower because TE
+requires the MLP output dimension to be a multiple of 16; `--mlp-width 8736`
+is the nearest valid width to the 101.916M Mamba configuration. D=2, D=4, and
+D=8 preserve progressively more Bayesian state capacity at a throughput cost.
+The previous 758,504 versus 756,067 tok/s pair was measured with an older
+Torch/TE stack and is retained only in the historical result JSON. Run the
+fastest current configuration with:
 
 ```bash
 python example/train_6layer.py --device cuda:0 --precision te-fp8 \
@@ -158,12 +162,23 @@ python example/train_6layer.py --device cuda:0 --precision te-fp8 \
   --steps 120 --warmup 5
 ```
 
-The raw records are [Bayesian](example/results/gb300_6layer_bayes_d1m8_tefp8_normfused_b120.json)
-and [Mamba-3](example/results/gb300_6layer_mamba3_tefp8_match_b120.json).
+The current raw records are [Bayesian D=1](example/results/gb300_6layer_bayes_d1_tefp8_current.json),
+[Bayesian D=2](example/results/gb300_6layer_bayes_d2_tefp8_current.json), and
+[Mamba-3](example/results/gb300_6layer_mamba3_tefp8_current.json).
 
 Use `--bayes-backend fused` when the lower-memory custom CUDA replay path is preferred. The recorded paper-feature result uses the Inductor backend with learned input-dependent dynamics; backend rankings can change with sequence length and batch shape.
 
-The D8 kernel has since received exact SM103 optimizations: the forward
+The D1, D2, D4, and D8 kernels have received exact SM103 optimizations. D1
+replay backward now uses warp-shuffle reductions; D2/D4 remove the temporary
+covariance tile, reuse `decay * key`, store only the symmetric replay triangle,
+and use warp barriers for their single-warp launches. On GB300, the D1 direct
+dynamic forward-plus-backward benchmark improved from 6.067 ms to 4.039 ms
+(1.50× throughput) at `N=8192, T=512, D=1, M=8`; its full parity check was
+≤`4.8e-7` forward and ≤`3.9e-6` gradients. The D2 benchmark improved from
+25.371 ms to 22.532 ms at `N=32768, T=512, D=2, M=8` (1.13× throughput),
+with ≤`4.8e-7` forward error and ≤`3.9e-6` gradient error.
+
+The D8 kernel has also received exact SM103 optimizations: the forward
 covariance prediction and mean innovation reuse `d * k`, covariance adjoints
 compute one symmetric triangle, and the backward decay gradient hoists the
 per-row reciprocal of the input-dependent decay.  On a GB300 with
