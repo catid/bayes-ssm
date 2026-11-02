@@ -27,28 +27,44 @@ The [`example/`](example/) directory contains a runnable causal language-model r
 
 ```bash
 python example/train_6layer.py --device cuda:0 --precision bf16 \
-  --fused-rmsnorm --compile-components both --optimize-bayes --bayes-backend inductor --cuda-graph --tokens train.npy --valid-tokens valid.npy \
-  --bayes-features fixed --seq 512 --batch 256 --steps 100 --warmup 5 --output run.json
+  --fused-rmsnorm --compile-components both --optimize-bayes \
+  --bayes-backend inductor --bayes-features paper --bayes-dynamics learned \
+  --cuda-graph --gpu-batch-staging --width 512 --heads 64 --kv-heads 4 \
+  --mlp-width 8448 --seq 512 --batch 256 --steps 60 --warmup 20 \
+  --output bayes_paper.json
 ```
 
-The matched Mamba-3/GQA run uses the same fixed shape and optimizer settings:
+The parameter-matched Mamba-3/GQA run uses the same six-layer layout, optimizer,
+and graph/DDP settings. Its MLP width is 8,403 so that both models have the
+same 101.94M parameter count (within 0.002%):
 
 ```bash
 python example/train_6layer_mamba3.py --device cuda:0 --precision bf16 \
   --fused-rmsnorm --compile-ffn --mixer hybrid --width 512 --heads 64 \
-  --kv-heads 4 --mlp-width 8258 --seq 512 --batch 256 --steps 60 --warmup 20 \
-  --cuda-graph --gpu-batch-staging --output mamba3_hybrid.json
+  --kv-heads 4 --mlp-width 8403 --seq 512 --batch 256 --steps 60 --warmup 20 \
+  --cuda-graph --gpu-batch-staging --output mamba3_paper_match.json
 ```
 
-The recorded GB300 result below is the fixed fast-path benchmark. It includes forward, backward, and fused AdamW updates, fixed-shape CUDA graph capture, independently compiled GQA/SwiGLU components, the exact dense-covariance recurrence with scalar dynamics, and two-rank NCCL DDP. Use `--bayes-features paper --bayes-dynamics learned` for the paper-feature path: causal depthwise Q/K/V convolution, input-dependent process/observation noise, and input-dependent diagonal transitions. That path remains exact dense covariance but uses the general diagonal-transition Inductor kernel and has additional parameters. Synthetic benchmark input staging is enabled only for the synthetic run; corpus-backed runs use the normal token loader. The first run pays the one-time component compilation cost. The final Bayesian record is [example/results/gb300_6layer_final.json](example/results/gb300_6layer_final.json). The corrected hybrid Mamba-3 record is [example/results/gb300_6layer_mamba3_hybrid.json](example/results/gb300_6layer_mamba3_hybrid.json); the earlier six-Mamba measurement is retained as an explicitly labeled control in [example/results/gb300_6layer_mamba3_apples.json](example/results/gb300_6layer_mamba3_apples.json). Both Mamba runs use [example/train_6layer_mamba3.py](example/train_6layer_mamba3.py). Every row below is a complete forward, backward, gradient-clipping, and fused-AdamW step on two GB300 ranks, with batch and sequence shown per GPU.
+The final paper-feature comparison below was measured on two GB300 GPUs with
+one NCCL DDP rank per GPU. Each timed step includes the complete forward pass,
+backward pass, gradient clipping, and fused AdamW update. Both models use BF16
+projections, TE fused RMSNorm, a 32k tied vocabulary head, GQA in blocks 3 and
+6, and the same 256 × 512 tokens per GPU. Bayesian blocks 1, 2, 4, and 5 use
+the exact dense-covariance recurrence with the paper's causal Q/K/V short
+convolutions, input-dependent process/observation noise, and input-dependent
+diagonal transitions. The first run pays one-time compilation cost; it is not
+included in the timed 60 steps. The raw records are [Bayesian](example/results/gb300_6layer_bayes_paper.json)
+and [Mamba-3](example/results/gb300_6layer_mamba3_paper_match.json).
 
-| Model | Parameters | Mixer layout | Precision and state | Batch × sequence / GPU | Throughput (global / per GPU) | Peak VRAM allocated / reserved / rank | Validation loss / PPL |
-|---|---:|---|---|---:|---:|---:|---:|
-| Bayesian/GQA six-layer | **100.604M** | Bayes, Bayes, GQA, Bayes, Bayes, GQA | BF16 projections + TE fused RMSNorm + FP32 Bayesian state and tied vocabulary head | 256 × 512 | **985,761 / 492,880 tok/s** | **122,581 / 163,268 MiB** | 10.3793 / 32,187 |
-| Mamba-3/GQA hybrid | **100.608M** | Mamba-3, Mamba-3, GQA, Mamba-3, Mamba-3, GQA | BF16 projections + TE fused RMSNorm + FP32 tied vocabulary head | 256 × 512 | **1,059,506 / 529,753 tok/s** | **118,589 / 164,714 MiB** | 10.3473 / 31,172 |
-| Mamba-3 all-Mamba control | **100.614M** | Six Mamba-3 SISO mixers | BF16 projections + TE fused RMSNorm + FP32 tied vocabulary head | 256 × 512 | **1,356,200 / 678,100 tok/s** | **122,724 / 170,970 MiB** | 10.3578 / 31,484 |
+| Model | Parameters | Mixer layout | Batch × sequence / GPU | Throughput (global / per GPU) | Peak VRAM allocated / reserved / rank | Validation loss / PPL |
+|---|---:|---|---:|---:|---:|---:|
+| Bayesian paper path | **101.942M** | Bayes, Bayes, GQA, Bayes, Bayes, GQA | 256 × 512 | **437,376 / 218,688 tok/s** | **149,228 / 191,220 MiB** | 10.3806 / 32,228 |
+| Mamba-3 matched hybrid | **101.944M** | Mamba-3, Mamba-3, GQA, Mamba-3, Mamba-3, GQA | 256 × 512 | **998,046 / 499,023 tok/s** | **119,268 / 165,628 MiB** | 10.3488 / 31,219 |
 
-The recurrent state and covariance remain FP32. The selectable fused CUDA backend launches on the active PyTorch stream, so CUDA graph replay executes its Bayesian forward and reverse kernels on every step; it retains exact dense-covariance math while storing only chunk boundaries and recomputation intermediates.
+The recurrent state and covariance remain FP32. The paper path is about 2.28×
+slower and uses about 25% more allocated VRAM than this Mamba-3 baseline at
+this shape; that cost is the exact dynamic dense-covariance computation, not a
+fixed-dynamics approximation.
 
 Use `--bayes-backend fused` when the lower-memory custom CUDA replay path is preferred; `inductor` with the fixed scalar dynamics is the fastest measured backend for the recorded shape.
 
