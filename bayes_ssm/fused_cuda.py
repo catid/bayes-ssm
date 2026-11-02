@@ -157,6 +157,13 @@ class _ChunkedBayesianFunction(torch.autograd.Function):
                 decay, process, observation, initial_mean, initial_covariance,
             )
         )
+        # The production mixer starts from constant zero/identity state.  Keep
+        # this separate from ``need_dynamics_grad`` so the reverse extension
+        # can omit only the two final initial-state gradient allocations while
+        # still returning exact learned transition/noise gradients.
+        ctx.need_initial_grad = (
+            initial_mean.requires_grad or initial_covariance.requires_grad
+        )
         ctx.output_shape = tuple(output.shape)
         ctx.mean_shape = tuple(final_mean.shape)
         ctx.covariance_shape = tuple(final_covariance.shape)
@@ -178,6 +185,7 @@ class _ChunkedBayesianFunction(torch.autograd.Function):
             initial_mean, initial_covariance, boundary_mean, boundary_covariance,
         ) = saved[:10]
         if ctx.use_saved_history:
+            ctx.noinitial_backward = False
             _, _, _, _, _, _, _, _, _, _, mp_history, pp_history, u_history, beta_history, e_history = saved
         extension = _load_extension(keys.shape[-1])
         if extension is None:  # pragma: no cover - extension loaded in forward
@@ -225,14 +233,26 @@ class _ChunkedBayesianFunction(torch.autograd.Function):
             # caller differentiates the initial state; falling through to
             # the dynamic reverse kernel would backpropagate through inputs
             # that the forward pass deliberately did not read.
-            backward = (
-                extension.backward_chunked_lean_fixed
-                if lean_backward else extension.backward_chunked_fixed
-            )
+            if not lean_backward and not ctx.need_initial_grad and hasattr(
+                extension, "backward_chunked_noinitial_fixed"
+            ):
+                backward = extension.backward_chunked_noinitial_fixed
+                ctx.noinitial_backward = True
+            else:
+                backward = (
+                    extension.backward_chunked_lean_fixed
+                    if lean_backward else extension.backward_chunked_fixed
+                )
         else:
-            backward = (extension.backward_chunked
-                        if not lean_backward
-                        else getattr(extension, "backward_chunked_lean", extension.backward_chunked))
+            if not lean_backward and not ctx.need_initial_grad and hasattr(
+                extension, "backward_chunked_noinitial"
+            ):
+                backward = extension.backward_chunked_noinitial
+                ctx.noinitial_backward = True
+            else:
+                backward = (extension.backward_chunked
+                            if not lean_backward
+                            else getattr(extension, "backward_chunked_lean", extension.backward_chunked))
         if ctx.use_saved_history:
             # The saved-history wrappers retain the final-state gradient
             # arguments in their ABI so the same kernel can serve both the
@@ -259,6 +279,11 @@ class _ChunkedBayesianFunction(torch.autograd.Function):
                 # only for keys/values/queries; the other five tensor inputs
                 # and three metadata values still need exactly eight slots.
                 return (*gradients, None, None, None, None, None, None, None, None)
+            # The no-initial ABI returns only six tensor gradients (keys,
+            # values, queries, decay, process, observation); the regular full
+            # ABI returns two additional initial-state gradients.
+            if ctx.noinitial_backward:
+                return (*gradients, None, None, None, None, None)
             return (*gradients, None, None, None)
         if lean_backward:
             # The CUDA lean entry points still keep the full ABI: they accept

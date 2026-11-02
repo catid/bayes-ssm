@@ -356,7 +356,11 @@ std::vector<torch::Tensor> forward_chunked_fixed(
  int n=keys.size(0),t=keys.size(1),nb=(t+chunks-1)/chunks;auto out=torch::empty({n,t,8},keys.options()),mf=torch::empty_like(mean0),cf=torch::empty_like(cov0),bm=torch::empty({n,nb+1,2,8},keys.options()),bc=torch::empty({n,nb+1,2,2},keys.options());constexpr int th=16;constexpr size_t sh=(2*8+2*4+2*2+2*8)*sizeof(float);cudaFuncSetAttribute(chunk_forward_kernel<2,8,th,true>,cudaFuncAttributeMaxDynamicSharedMemorySize,(int)sh);auto st=at::cuda::getCurrentCUDAStream();chunk_forward_kernel<2,8,th,true><<<n,th,sh,st>>>(keys.data_ptr<float>(),values.data_ptr<float>(),queries.data_ptr<float>(),decay.data_ptr<float>(),process.data_ptr<float>(),observation.data_ptr<float>(),mean0.data_ptr<float>(),cov0.data_ptr<float>(),out.data_ptr<float>(),mf.data_ptr<float>(),cf.data_ptr<float>(),bm.data_ptr<float>(),bc.data_ptr<float>(),n,t,chunks,nb,(float)floor);C10_CUDA_KERNEL_LAUNCH_CHECK();return {out,mf,cf,bm,bc};
 }
 
-template<bool NEED_DYNAMICS,bool FIXED=false>
+// NEED_INITIAL controls whether the final recurrent-state gradients are
+// copied to output tensors.  The recurrent gM/gC tiles are still kept in
+// shared/global state while traversing chunks; callers whose initial state is
+// a constant do not need the final two device allocations or copies.
+template<bool NEED_DYNAMICS,bool FIXED=false,bool NEED_INITIAL=true>
 std::vector<torch::Tensor> backward_chunked_impl(
  torch::Tensor keys,torch::Tensor values,torch::Tensor queries,torch::Tensor decay,torch::Tensor process,torch::Tensor observation,torch::Tensor mean0,torch::Tensor cov0,torch::Tensor bm,torch::Tensor bc,torch::Tensor gy,torch::Tensor gmf,torch::Tensor gcf,int chunks,double floor){
  TORCH_CHECK(keys.is_cuda() && keys.scalar_type()==at::kFloat && keys.is_contiguous() && values.is_contiguous() && queries.is_contiguous() && decay.is_contiguous() && process.is_contiguous() && observation.is_contiguous() && mean0.is_contiguous() && cov0.is_contiguous() && bm.is_contiguous() && bc.is_contiguous() && gy.is_contiguous() && gmf.is_contiguous() && gcf.is_contiguous(), "fused Bayesian backward inputs must be contiguous CUDA float32 tensors");
@@ -365,8 +369,11 @@ std::vector<torch::Tensor> backward_chunked_impl(
  torch::Tensor gd, gp, gr, gm0, gc0;
  if constexpr (NEED_DYNAMICS) {
    gd=torch::zeros_like(decay); gp=torch::zeros_like(process);
-   gr=torch::zeros_like(observation); gm0=torch::zeros_like(mean0);
-   gc0=torch::zeros_like(cov0);
+   gr=torch::zeros_like(observation);
+   if constexpr (NEED_INITIAL) {
+     gm0=torch::zeros_like(mean0);
+     gc0=torch::zeros_like(cov0);
+   }
  }
  auto gm=torch::empty_like(mean0),gc=torch::empty_like(cov0);
  gm.copy_(gmf); gc.copy_(gcf);
@@ -397,8 +404,11 @@ std::vector<torch::Tensor> backward_chunked_impl(
    C10_CUDA_KERNEL_LAUNCH_CHECK();
  }
  if constexpr (NEED_DYNAMICS) {
-   gm0.copy_(gm); gc0.copy_(gc);
-   return {gk,gv,gq,gd,gp,gr,gm0,gc0};
+   if constexpr (NEED_INITIAL) {
+     gm0.copy_(gm); gc0.copy_(gc);
+     return {gk,gv,gq,gd,gp,gr,gm0,gc0};
+   }
+   return {gk,gv,gq,gd,gp,gr};
  }
  return {gk,gv,gq};
 }
@@ -406,6 +416,15 @@ std::vector<torch::Tensor> backward_chunked_impl(
 std::vector<torch::Tensor> backward_chunked(
  torch::Tensor keys,torch::Tensor values,torch::Tensor queries,torch::Tensor decay,torch::Tensor process,torch::Tensor observation,torch::Tensor mean0,torch::Tensor cov0,torch::Tensor bm,torch::Tensor bc,torch::Tensor gy,torch::Tensor gmf,torch::Tensor gcf,int chunks,double floor){
  return backward_chunked_impl<true,false>(keys,values,queries,decay,process,observation,mean0,cov0,bm,bc,gy,gmf,gcf,chunks,floor);
+}
+
+// Dynamic transitions/noise are differentiable in the production paper path,
+// while the zero initial mean/covariance are constants.  This ABI omits only
+// the unused initial-state gradient outputs; all key/value/query and learned
+// dynamics gradients remain exact.
+std::vector<torch::Tensor> backward_chunked_noinitial(
+ torch::Tensor keys,torch::Tensor values,torch::Tensor queries,torch::Tensor decay,torch::Tensor process,torch::Tensor observation,torch::Tensor mean0,torch::Tensor cov0,torch::Tensor bm,torch::Tensor bc,torch::Tensor gy,torch::Tensor gmf,torch::Tensor gcf,int chunks,double floor){
+ return backward_chunked_impl<true,false,false>(keys,values,queries,decay,process,observation,mean0,cov0,bm,bc,gy,gmf,gcf,chunks,floor);
 }
 
 std::vector<torch::Tensor> backward_chunked_lean(
@@ -424,4 +443,9 @@ std::vector<torch::Tensor> backward_chunked_fixed(
  return backward_chunked_impl<true,true>(keys,values,queries,decay,process,observation,mean0,cov0,bm,bc,gy,gmf,gcf,chunks,floor);
 }
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME,m){m.def("forward_chunked",&forward_chunked);m.def("backward_chunked",&backward_chunked);m.def("backward_chunked_lean",&backward_chunked_lean);m.def("forward_chunked_fixed",&forward_chunked_fixed);m.def("backward_chunked_lean_fixed",&backward_chunked_lean_fixed);m.def("backward_chunked_fixed",&backward_chunked_fixed);}
+std::vector<torch::Tensor> backward_chunked_noinitial_fixed(
+ torch::Tensor keys,torch::Tensor values,torch::Tensor queries,torch::Tensor decay,torch::Tensor process,torch::Tensor observation,torch::Tensor mean0,torch::Tensor cov0,torch::Tensor bm,torch::Tensor bc,torch::Tensor gy,torch::Tensor gmf,torch::Tensor gcf,int chunks,double floor){
+ return backward_chunked_impl<true,true,false>(keys,values,queries,decay,process,observation,mean0,cov0,bm,bc,gy,gmf,gcf,chunks,floor);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME,m){m.def("forward_chunked",&forward_chunked);m.def("backward_chunked",&backward_chunked);m.def("backward_chunked_noinitial",&backward_chunked_noinitial);m.def("backward_chunked_lean",&backward_chunked_lean);m.def("forward_chunked_fixed",&forward_chunked_fixed);m.def("backward_chunked_lean_fixed",&backward_chunked_lean_fixed);m.def("backward_chunked_fixed",&backward_chunked_fixed);m.def("backward_chunked_noinitial_fixed",&backward_chunked_noinitial_fixed);}
