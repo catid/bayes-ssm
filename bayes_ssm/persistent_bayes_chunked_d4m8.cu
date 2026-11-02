@@ -335,13 +335,13 @@ std::vector<torch::Tensor> forward_chunked(
  TORCH_CHECK(keys.scalar_type()==at::kFloat && values.scalar_type()==at::kFloat && queries.scalar_type()==at::kFloat, "fused Bayesian inputs must be float32");
  TORCH_CHECK(keys.is_contiguous() && values.is_contiguous() && queries.is_contiguous() && decay.is_contiguous() && process.is_contiguous() && observation.is_contiguous() && mean0.is_contiguous() && cov0.is_contiguous(), "fused Bayesian inputs must be contiguous");
  TORCH_CHECK(chunks > 0 && keys.dim()==3 && values.dim()==3 && queries.dim()==3 && keys.size(2)==4 && values.size(2)==8 && queries.size(2)==4, "fused Bayesian kernel expects [N,T,8] tensors");
- int n=keys.size(0),t=keys.size(1),nb=(t+chunks-1)/chunks;auto out=torch::empty({n,t,8},keys.options()),mf=torch::empty_like(mean0),cf=torch::empty_like(cov0),bm=torch::empty({n,nb+1,4,8},keys.options()),bc=torch::empty({n,nb+1,4,4},keys.options());constexpr int th=32;size_t sh=(3*8*8+2*8+8)*sizeof(float);cudaFuncSetAttribute(chunk_forward_kernel<4,8,th>,cudaFuncAttributeMaxDynamicSharedMemorySize,(int)sh);auto st=at::cuda::getCurrentCUDAStream();chunk_forward_kernel<4,8,th><<<n,th,sh,st>>>(keys.data_ptr<float>(),values.data_ptr<float>(),queries.data_ptr<float>(),decay.data_ptr<float>(),process.data_ptr<float>(),observation.data_ptr<float>(),mean0.data_ptr<float>(),cov0.data_ptr<float>(),out.data_ptr<float>(),mf.data_ptr<float>(),cf.data_ptr<float>(),bm.data_ptr<float>(),bc.data_ptr<float>(),n,t,chunks,nb,(float)floor);C10_CUDA_KERNEL_LAUNCH_CHECK();return {out,mf,cf,bm,bc};
+ int n=keys.size(0),t=keys.size(1),nb=(t+chunks-1)/chunks;auto out=torch::empty({n,t,8},keys.options()),mf=torch::empty_like(mean0),cf=torch::empty_like(cov0),bm=torch::empty({n,nb+1,4,8},keys.options()),bc=torch::empty({n,nb+1,4,4},keys.options());constexpr int th=32;constexpr size_t sh=(4*8+4*4+2*4+2*8)*sizeof(float);cudaFuncSetAttribute(chunk_forward_kernel<4,8,th>,cudaFuncAttributeMaxDynamicSharedMemorySize,(int)sh);auto st=at::cuda::getCurrentCUDAStream();chunk_forward_kernel<4,8,th><<<n,th,sh,st>>>(keys.data_ptr<float>(),values.data_ptr<float>(),queries.data_ptr<float>(),decay.data_ptr<float>(),process.data_ptr<float>(),observation.data_ptr<float>(),mean0.data_ptr<float>(),cov0.data_ptr<float>(),out.data_ptr<float>(),mf.data_ptr<float>(),cf.data_ptr<float>(),bm.data_ptr<float>(),bc.data_ptr<float>(),n,t,chunks,nb,(float)floor);C10_CUDA_KERNEL_LAUNCH_CHECK();return {out,mf,cf,bm,bc};
 }
 
 std::vector<torch::Tensor> forward_chunked_fixed(
  torch::Tensor keys,torch::Tensor values,torch::Tensor queries,torch::Tensor decay,torch::Tensor process,torch::Tensor observation,torch::Tensor mean0,torch::Tensor cov0,int chunks,double floor){
  TORCH_CHECK(keys.is_cuda() && values.is_cuda() && queries.is_cuda(), "fused Bayesian CUDA inputs must be CUDA tensors");
- int n=keys.size(0),t=keys.size(1),nb=(t+chunks-1)/chunks;auto out=torch::empty({n,t,8},keys.options()),mf=torch::empty_like(mean0),cf=torch::empty_like(cov0),bm=torch::empty({n,nb+1,4,8},keys.options()),bc=torch::empty({n,nb+1,4,4},keys.options());constexpr int th=32;size_t sh=(2*8*8+3*8)*sizeof(float);cudaFuncSetAttribute(chunk_forward_kernel<4,8,th,true>,cudaFuncAttributeMaxDynamicSharedMemorySize,(int)sh);auto st=at::cuda::getCurrentCUDAStream();chunk_forward_kernel<4,8,th,true><<<n,th,sh,st>>>(keys.data_ptr<float>(),values.data_ptr<float>(),queries.data_ptr<float>(),decay.data_ptr<float>(),process.data_ptr<float>(),observation.data_ptr<float>(),mean0.data_ptr<float>(),cov0.data_ptr<float>(),out.data_ptr<float>(),mf.data_ptr<float>(),cf.data_ptr<float>(),bm.data_ptr<float>(),bc.data_ptr<float>(),n,t,chunks,nb,(float)floor);C10_CUDA_KERNEL_LAUNCH_CHECK();return {out,mf,cf,bm,bc};
+ int n=keys.size(0),t=keys.size(1),nb=(t+chunks-1)/chunks;auto out=torch::empty({n,t,8},keys.options()),mf=torch::empty_like(mean0),cf=torch::empty_like(cov0),bm=torch::empty({n,nb+1,4,8},keys.options()),bc=torch::empty({n,nb+1,4,4},keys.options());constexpr int th=32;constexpr size_t sh=(4*8+4*4+2*4+2*8)*sizeof(float);cudaFuncSetAttribute(chunk_forward_kernel<4,8,th,true>,cudaFuncAttributeMaxDynamicSharedMemorySize,(int)sh);auto st=at::cuda::getCurrentCUDAStream();chunk_forward_kernel<4,8,th,true><<<n,th,sh,st>>>(keys.data_ptr<float>(),values.data_ptr<float>(),queries.data_ptr<float>(),decay.data_ptr<float>(),process.data_ptr<float>(),observation.data_ptr<float>(),mean0.data_ptr<float>(),cov0.data_ptr<float>(),out.data_ptr<float>(),mf.data_ptr<float>(),cf.data_ptr<float>(),bm.data_ptr<float>(),bc.data_ptr<float>(),n,t,chunks,nb,(float)floor);C10_CUDA_KERNEL_LAUNCH_CHECK();return {out,mf,cf,bm,bc};
 }
 
 template<bool NEED_DYNAMICS,bool FIXED=false>
@@ -368,15 +368,16 @@ std::vector<torch::Tensor> backward_chunked_impl(
  // D4/M8 uses one warp per independent sequence; a second warp only repeats
  // mostly idle scalar-state work and lowers SM occupancy.
  constexpr int th=32;
- size_t sh=(FIXED ? 3*8*8+3*8+th : 4*8*8+3*8+th)*sizeof(float);
- cudaFuncSetAttribute(recompute_chunk_kernel<4,8,th,FIXED>,cudaFuncAttributeMaxDynamicSharedMemorySize,(int)((FIXED ? 2*8*8+3*8 : 3*8*8+3*8)*sizeof(float)));
- cudaFuncSetAttribute(backward_chunk_kernel<4,8,th,NEED_DYNAMICS,FIXED>,cudaFuncAttributeMaxDynamicSharedMemorySize,(int)sh);
+ constexpr size_t recompute_sh=(4*8+4*4+2*4+2*8)*sizeof(float);
+ constexpr size_t backward_sh=((FIXED ? 4*8 : 2*4*8) + 2*4*4 + 8 + 3*4 + th)*sizeof(float);
+ cudaFuncSetAttribute(recompute_chunk_kernel<4,8,th,FIXED>,cudaFuncAttributeMaxDynamicSharedMemorySize,(int)recompute_sh);
+ cudaFuncSetAttribute(backward_chunk_kernel<4,8,th,NEED_DYNAMICS,FIXED>,cudaFuncAttributeMaxDynamicSharedMemorySize,(int)backward_sh);
  auto st=at::cuda::getCurrentCUDAStream();
  for(int ci=nb-1;ci>=0;--ci){
-   recompute_chunk_kernel<4,8,th,FIXED><<<n,th,(FIXED ? 2*8*8+3*8 : 3*8*8+3*8)*sizeof(float),st>>>(
+   recompute_chunk_kernel<4,8,th,FIXED><<<n,th,recompute_sh,st>>>(
      keys.data_ptr<float>(),values.data_ptr<float>(),decay.data_ptr<float>(),process.data_ptr<float>(),observation.data_ptr<float>(),
      bm.data_ptr<float>(),bc.data_ptr<float>(),mp.data_ptr<float>(),pp.data_ptr<float>(),uh.data_ptr<float>(),bh.data_ptr<float>(),eh.data_ptr<float>(),n,t,chunks,nb,ci,(float)floor);
-   backward_chunk_kernel<4,8,th,NEED_DYNAMICS,FIXED><<<n,th,sh,st>>>(
+   backward_chunk_kernel<4,8,th,NEED_DYNAMICS,FIXED><<<n,th,backward_sh,st>>>(
      keys.data_ptr<float>(),values.data_ptr<float>(),queries.data_ptr<float>(),decay.data_ptr<float>(),process.data_ptr<float>(),observation.data_ptr<float>(),
      mean0.data_ptr<float>(),cov0.data_ptr<float>(),bm.data_ptr<float>(),bc.data_ptr<float>(),mp.data_ptr<float>(),pp.data_ptr<float>(),uh.data_ptr<float>(),bh.data_ptr<float>(),eh.data_ptr<float>(),
      gy.data_ptr<float>(),gk.data_ptr<float>(),gv.data_ptr<float>(),gq.data_ptr<float>(),gd_ptr,gp_ptr,gr_ptr,gm.data_ptr<float>(),gc.data_ptr<float>(),n,t,chunks,nb,ci,(float)floor);
