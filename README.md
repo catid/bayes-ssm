@@ -72,6 +72,14 @@ the timed training measurement.
 
 Use `--bayes-backend fused` when the lower-memory custom CUDA replay path is preferred. The recorded paper-feature result uses the Inductor backend with learned input-dependent dynamics; backend rankings can change with sequence length and batch shape.
 
+The paper's damped rotational variant is available with
+`--bayes-dynamics rotation`. It embeds each scalar Q/K component as
+`(component, 0)`, learns an input-dependent radius and angle for every 2-D
+state pair, and injects process noise only into the first coordinate. The
+covariance remains dense; the structured kernel applies the 2-D blocks without
+materializing a dense transition matrix. This mode is selectable but is not the
+diagonal-dynamics row in the benchmark table above.
+
 The validation stream is synthetic random data, so its loss is a health check rather than a language-quality claim.
 
 ## Install

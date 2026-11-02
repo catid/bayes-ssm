@@ -251,6 +251,95 @@ def _core_loop_diagonal_transition(
     return torch.stack(outputs, dim=-2), mean, covariance
 
 
+def _core_loop_rotation(
+    keys: Tensor,
+    values: Tensor,
+    queries: Tensor,
+    rotation_radii: Tensor,
+    rotation_angles: Tensor,
+    process_variances: Tensor,
+    observation_variances: Tensor,
+    mean: Tensor,
+    covariance: Tensor,
+    denominator_floor: float,
+) -> Tuple[Tensor, Tensor, Tensor]:
+    """Exact dense-covariance core for block-diagonal 2-D rotations.
+
+    ``mean`` and ``covariance`` retain the paper's full state dimensions.  The
+    only specialization is applying each 2x2 damped rotation by reshaping the
+    rows and columns of the dense covariance, avoiding materialization of a
+    D-by-D transition matrix and its two cubic matmuls.
+    """
+    outputs = []
+    d = keys.shape[-1]
+    pairs = d // 2
+    for i in range(keys.shape[-2]):
+        radius = rotation_radii[..., i, :]
+        angle = rotation_angles[..., i, :]
+        radius = radius.clamp_min(torch.finfo(covariance.dtype).tiny)
+        radius = torch.where(radius <= 1.0, radius, torch.ones_like(radius))
+        c = radius * torch.cos(angle)
+        s = radius * torch.sin(angle)
+        mean_pairs = mean.reshape(*mean.shape[:-2], pairs, 2, mean.shape[-1])
+        mean0, mean1 = mean_pairs[..., 0, :], mean_pairs[..., 1, :]
+        predicted_mean = torch.stack(
+            (c[..., None] * mean0 - s[..., None] * mean1,
+             s[..., None] * mean0 + c[..., None] * mean1), dim=-2
+        ).reshape_as(mean)
+        # Apply R on covariance rows, then R^T on covariance columns.  This
+        # preserves all off-diagonal covariance entries exactly.
+        rows = covariance.reshape(*covariance.shape[:-2], pairs, 2, d)
+        row0, row1 = rows[..., 0, :], rows[..., 1, :]
+        left = torch.stack(
+            (c[..., None] * row0 - s[..., None] * row1,
+             s[..., None] * row0 + c[..., None] * row1), dim=-2
+        ).reshape(*covariance.shape[:-2], d, d)
+        cols = left.reshape(*left.shape[:-2], d, pairs, 2)
+        col0, col1 = cols[..., 0], cols[..., 1]
+        predicted_covariance = torch.stack(
+            (c.unsqueeze(-2) * col0 - s.unsqueeze(-2) * col1,
+             s.unsqueeze(-2) * col0 + c.unsqueeze(-2) * col1), dim=-1
+        ).reshape_as(covariance)
+        process_diag = torch.zeros(
+            *covariance.shape[:-2], d, device=covariance.device, dtype=covariance.dtype
+        )
+        process_diag[..., 0::2] = process_variances[..., i, :]
+        predicted_covariance = torch.diagonal_scatter(
+            predicted_covariance,
+            torch.diagonal(predicted_covariance, dim1=-2, dim2=-1) + process_diag,
+            dim1=-2, dim2=-1,
+        )
+        key = keys[..., i, :]
+        uncertainty_key = torch.matmul(predicted_covariance, key.unsqueeze(-1)).squeeze(-1)
+        innovation_variance = observation_variances[..., i] + torch.sum(key * uncertainty_key, dim=-1)
+        beta = innovation_variance.clamp_min(denominator_floor).reciprocal()
+        innovation = values[..., i, :] - torch.matmul(
+            predicted_mean.transpose(-1, -2), key.unsqueeze(-1)
+        ).squeeze(-1)
+        mean = predicted_mean + beta[..., None, None] * uncertainty_key[..., :, None] * innovation[..., None, :]
+        covariance = predicted_covariance - beta[..., None, None] * uncertainty_key[..., :, None] * uncertainty_key[..., None, :]
+        covariance = (covariance + covariance.transpose(-1, -2)) * 0.5
+        outputs.append(torch.matmul(mean.transpose(-1, -2), queries[..., i, :].unsqueeze(-1)).squeeze(-1))
+    return torch.stack(outputs, dim=-2), mean, covariance
+
+
+_ROTATION_CORES: dict[tuple[object, ...], object] = {}
+
+
+def _run_compiled_rotation(*args):
+    """Compile/cache the compact exact rotational recurrence."""
+    mode = _compiled_core_mode()
+    key = ("rotation", "mode", mode) + _compiled_core_key(args)
+    core = _ROTATION_CORES.get(key)
+    if core is None:
+        core = torch.compile(_core_loop_rotation, fullgraph=False, dynamic=False, mode=mode)
+        _ROTATION_CORES[key] = core
+    try:
+        return core(*args)
+    except _COMPILE_FALLBACK_EXCEPTIONS:
+        return _core_loop_rotation(*args)
+
+
 def _core_loop_fixed_diagonal(
     keys: Tensor,
     values: Tensor,
@@ -648,6 +737,8 @@ def bayesian_layer(
     *,
     transitions: Optional[Tensor] = None,
     transition_diagonals: Optional[Tensor] = None,
+    rotation_radii: Optional[Tensor] = None,
+    rotation_angles: Optional[Tensor] = None,
     process_variances: Optional[Tensor | Real] = None,
     process_covariances: Optional[Tensor] = None,
     observation_variances: Optional[Tensor | Real] = None,
@@ -669,6 +760,9 @@ def bayesian_layer(
         transition_diagonals: optional ``[..., T, D]`` diagonal dynamics. This is
             mutually exclusive with ``transitions`` and enables a compiled
             diagonal specialization without materializing ``D×D`` matrices.
+        rotation_radii/rotation_angles: optional ``[..., T, D/2]`` damped 2-D
+            rotational dynamics. Adjacent coordinates use ``rho R(theta)``;
+            process noise is injected into the first coordinate of each pair.
         process_variances: ``[..., T]`` isotropic process variances (``ell_t^2``).
         process_covariances: optional full ``[..., T, D, D]`` process covariance;
             mutually exclusive with ``process_variances``.
@@ -732,8 +826,14 @@ def bayesian_layer(
     _check_finite(keys, "keys")
     _check_finite(values, "values")
     _check_finite(queries, "queries")
+    if (rotation_radii is None) != (rotation_angles is None):
+        raise ValueError("rotation_radii and rotation_angles must be supplied together")
     if transitions is not None and transition_diagonals is not None:
         raise ValueError("pass transitions or transition_diagonals, not both")
+    if (rotation_radii is not None or rotation_angles is not None) and (
+        transitions is not None or transition_diagonals is not None
+    ):
+        raise ValueError("rotation dynamics are mutually exclusive with transitions and transition_diagonals")
     if not isinstance(replay_ssm, bool):
         raise TypeError("replay_ssm must be a bool")
     if not isinstance(fixed_dynamics, bool):
@@ -742,7 +842,28 @@ def bayesian_layer(
     # specialized core below still carries a full dense covariance; it only
     # avoids materializing diagonal A and its redundant matrix products.
     diagonal_transition = None
-    if transition_diagonals is not None:
+    rotation_transition = None
+    if rotation_radii is not None:
+        if d % 2:
+            raise ValueError("rotational dynamics require an even key dimension")
+        for name, value in (("rotation_radii", rotation_radii), ("rotation_angles", rotation_angles)):
+            if not isinstance(value, Tensor) or value.ndim < 2:
+                raise ValueError(f"{name} must have shape [..., T={t}, D/2={d // 2}]")
+            if not value.is_floating_point():
+                raise TypeError(f"{name} must have a floating-point dtype")
+            if value.shape[-2:] != (t, d // 2):
+                raise ValueError(f"{name} must end in {(t, d // 2)}, got {tuple(value.shape)}")
+            if not _broadcastable(value.shape[:-2], batch_shape):
+                raise ValueError(f"{name} batch dimensions are not broadcastable to input batch")
+            value = value.to(device=device, dtype=dtype)
+            _check_finite(value, name)
+            if name == "rotation_radii":
+                rotation_radii = value
+            else:
+                rotation_angles = value
+        rotation_transition = True
+        transitions = None
+    elif transition_diagonals is not None:
         if not isinstance(transition_diagonals, Tensor) or transition_diagonals.ndim < 2:
             raise ValueError(f"transition_diagonals must have shape [..., T={t}, D={d}]")
         if not transition_diagonals.is_floating_point():
@@ -769,9 +890,34 @@ def bayesian_layer(
         if not _broadcastable(transitions.shape[:-3], batch_shape):
             raise ValueError("transitions batch dimensions are not broadcastable to the input batch")
         _check_finite(transitions, "transitions")
-    if process_covariances is not None and process_variances is not None:
+    if rotation_transition:
+        if process_covariances is not None:
+            raise ValueError("rotational dynamics require per-pair process_variances, not process_covariances")
+        if process_variances is None:
+            process_variances = torch.zeros(*batch_shape, t, d // 2, device=device, dtype=dtype)
+        else:
+            process_variances = _as_tensor(
+                process_variances, device=device, dtype=dtype, name="process_variances"
+            )
+            if process_variances.ndim == 0:
+                process_variances = process_variances.expand(*batch_shape, t, d // 2)
+            elif process_variances.shape[-2:] == (t, d // 2) and _broadcastable(
+                process_variances.shape[:-2], batch_shape
+            ):
+                process_variances = process_variances.expand(*batch_shape, t, d // 2)
+            else:
+                raise ValueError(
+                    f"rotational process_variances must be scalar or end in {(t, d // 2)}"
+                )
+            _validate_variance(process_variances, "process_variances", strictly_positive=False)
+        process_covariances = None
+    elif process_covariances is not None and process_variances is not None:
         raise ValueError("pass process_covariances or process_variances, not both")
-    if process_covariances is not None:
+    if rotation_transition:
+        # Rotational process variances are stored per 2-D state pair and are
+        # consumed directly by the structured recurrence below.
+        pass
+    elif process_covariances is not None:
         if not isinstance(process_covariances, Tensor) or process_covariances.ndim < 3:
             raise ValueError(f"process_covariances must have shape [..., T={t}, D={d}, D={d}]")
         if not process_covariances.is_floating_point():
@@ -782,7 +928,7 @@ def bayesian_layer(
         if not _broadcastable(process_covariances.shape[:-3], batch_shape):
             raise ValueError("process_covariances batch dimensions are not broadcastable to the input batch")
         _validate_covariance(process_covariances, "process_covariances", d)
-    else:
+    elif not rotation_transition:
         if process_variances is None:
             process_variances = 0.0
         process_variances = _as_time_tensor(
@@ -847,11 +993,40 @@ def bayesian_layer(
             eye = torch.eye(d, device=device, dtype=dtype)
             process_covariances = process_variances[..., None, None] * eye
         diagonal_transition = None
+    if rotation_transition and not optimized:
+        # The eager oracle uses the same generic dense recurrence.  The
+        # optimized path above avoids these temporaries with the structured
+        # row/column rotation kernel.
+        radius = rotation_radii.clamp_min(torch.finfo(dtype).tiny)
+        radius = torch.where(radius <= 1.0, radius, torch.ones_like(radius))
+        transitions = make_rotation_dynamics(torch.log(radius), rotation_angles)
+        process_covariances = make_rotation_process_covariances(process_variances)
+        rotation_transition = None
     if chunk_length is None:
         # A missing chunk length means one full sequence chunk. Use explicit
         # ``chunk_length=1`` when a token-by-token oracle is desired.
         chunk_length = t
     if optimized:
+        if rotation_transition:
+            # Compact rotational specialization: retain dense covariance but
+            # apply each 2x2 block by row/column reshapes instead of forming
+            # dense transition and process-covariance tensors.
+            outputs = []
+            for start in range(0, t, chunk_length):
+                stop = min(t, start + chunk_length)
+                mean = mean.contiguous()
+                covariance = covariance.contiguous()
+                core_args = (
+                    keys[..., start:stop, :], values[..., start:stop, :],
+                    queries[..., start:stop, :], rotation_radii[..., start:stop, :],
+                    rotation_angles[..., start:stop, :],
+                    process_variances[..., start:stop, :],
+                    observation_variances[..., start:stop], mean, covariance,
+                    float(denominator_floor),
+                )
+                output, mean, covariance = _run_compiled_rotation(*core_args)
+                outputs.append(output)
+            return torch.cat(outputs, dim=-2), mean, covariance
         # The six-layer production configuration uses 64-dimensional heads
         # with diagonal dynamics and scalar isotropic process noise.  Dispatch
         # that exact case to the optional persistent CUDA kernel before the
@@ -867,10 +1042,6 @@ def bayesian_layer(
             and m == 64
             and diagonal_transition is not None
             and process_covariances is None
-            and not process_variances.requires_grad
-            and not observation_variances.requires_grad
-            and not mean.requires_grad
-            and not covariance.requires_grad
         ):
             try:
                 from .fused_cuda import fused_diagonal_bayesian
@@ -945,8 +1116,16 @@ def bayesian_layer(
                 if (
                     fixed_dynamics
                     and not diagonal_transition.requires_grad
-                    and not process_variances.requires_grad
-                    and not observation_variances.requires_grad
+                    # The custom reverse kernel also computes exact process
+                    # and observation-noise gradients. Keep the dynamic path
+                    # opt-in until validated on the target CUDA toolchain.
+                    and (
+                        (
+                            not process_variances.requires_grad
+                            and not observation_variances.requires_grad
+                        )
+                        or os.environ.get("BAYES_SSM_ALLOW_DYNAMIC_FUSED", "0") == "1"
+                    )
                 ):
                     output, mean, covariance = _run_compiled_fixed_diagonal(*core_args)
                 else:
@@ -971,6 +1150,12 @@ def bayesian_layer(
                     output, mean, covariance = _run_compiled_core(*chunk_args)
             outputs.append(output)
         return torch.cat(outputs, dim=-2), mean, covariance
+    if rotation_transition:
+        return _core_loop_rotation(
+            keys, values, queries, rotation_radii, rotation_angles,
+            process_variances, observation_variances, mean, covariance,
+            float(denominator_floor),
+        )
     if diagonal_transition is not None:
         transitions = torch.diag_embed(diagonal_transition)
         if process_covariances is None:

@@ -168,11 +168,18 @@ class BayesianMixer(nn.Module):
         self.chunk_length = chunk_length
         if bayes_features not in {"fixed", "paper"}:
             raise ValueError("bayes_features must be 'fixed' or 'paper'")
-        if bayes_dynamics not in {"learned", "identity"}:
-            raise ValueError("bayes_dynamics must be 'learned' or 'identity'")
+        if bayes_dynamics not in {"learned", "identity", "rotation"}:
+            raise ValueError("bayes_dynamics must be 'learned', 'identity', or 'rotation'")
+        if bayes_dynamics == "rotation" and bayes_features != "paper":
+            raise ValueError("rotation dynamics require bayes_features='paper'")
+        if bayes_dynamics == "rotation" and (self.head_dim % 2):
+            raise ValueError("rotation dynamics require an even per-head dimension")
         self.bayes_features = bayes_features
         self.bayes_dynamics = bayes_dynamics
-        self.fuse_paper_qkv = bool(fuse_paper_qkv)
+        # The rotation parameterization has different Q/K and V widths
+        # (keys/queries occupy the first coordinate of each pair), so retain
+        # separate projections for that mode.
+        self.fuse_paper_qkv = bool(fuse_paper_qkv and bayes_dynamics != "rotation")
         # The auxiliary projection can only be concatenated when Q/K/V are
         # already concatenated; keep this effective flag false for the
         # legacy three-projection reference path.  TransformerEngine FP8
@@ -225,12 +232,13 @@ class BayesianMixer(nn.Module):
                 with torch.no_grad():
                     self.qkv_conv.weight[:, 0, -1] = 1
             else:
+                qk_width = width // 2 if bayes_dynamics == "rotation" else width
                 self.q_conv = nn.Conv1d(
-                    width, width, kernel_size=4, groups=width, bias=False,
+                    qk_width, qk_width, kernel_size=4, groups=qk_width, bias=False,
                     dtype=factory.dtype,
                 )
                 self.k_conv = nn.Conv1d(
-                    width, width, kernel_size=4, groups=width, bias=False,
+                    qk_width, qk_width, kernel_size=4, groups=qk_width, bias=False,
                     dtype=factory.dtype,
                 )
                 self.v_conv = nn.Conv1d(
@@ -246,7 +254,32 @@ class BayesianMixer(nn.Module):
             # the exact dense covariance while avoiding a large extra head-D
             # projection. Zero weights plus calibrated biases start at the
             # fixed path's Q=.1 and R=1 values.
-            if bayes_dynamics == "learned":
+            if bayes_dynamics == "rotation":
+                # One radius and one angle per 2-D state pair.  The radius
+                # uses the same bounded exp(-softplus(.)) parameterization as
+                # diagonal dynamics; zero angle initializes to a diagonal
+                # positive transition while retaining learnable rotations.
+                self.rotation_proj = factory.linear(width, width, bias=True)
+                nn.init.zeros_(self.rotation_proj.weight)
+                nn.init.zeros_(self.rotation_proj.bias)
+                half_lives = torch.logspace(
+                    math.log10(32.0), math.log10(4096.0), width // 2,
+                    device=self.norm.weight.device, dtype=torch.float32,
+                )
+                raw = torch.log(torch.expm1(math.log(2.0) / half_lives))
+                rotation_bias = self.rotation_proj.bias.data.view(
+                    self.heads, 2, self.head_dim // 2
+                )
+                rotation_bias[:, 0, :].copy_(raw.to(rotation_bias.dtype).view(
+                    self.heads, self.head_dim // 2
+                ))
+                self.decay_proj = None
+                self.noise_proj = factory.linear(width, 2 * heads, bias=True)
+                nn.init.zeros_(self.noise_proj.weight)
+                nn.init.zeros_(self.noise_proj.bias)
+                self.noise_proj.bias.data[0::2].fill_(math.log(math.expm1(0.1)))
+                self.noise_proj.bias.data[1::2].fill_(math.log(math.expm1(1.0)))
+            elif bayes_dynamics == "learned":
                 # A learned diagonal transition is input-dependent. Initialize
                 # per-coordinate half-lives over the paper's 32..4096-token
                 # range, then let the input projection modulate them.
@@ -288,15 +321,19 @@ class BayesianMixer(nn.Module):
                     self.noise_proj.bias.data[0::2].fill_(math.log(math.expm1(0.1)))
                     self.noise_proj.bias.data[1::2].fill_(math.log(math.expm1(1.0)))
             else:
+                self.rotation_proj = None
                 self.decay_proj = None
                 self.noise_proj = factory.linear(width, 2 * heads, bias=True)
                 nn.init.zeros_(self.noise_proj.weight)
                 nn.init.zeros_(self.noise_proj.bias)
                 self.noise_proj.bias.data[0::2].fill_(math.log(math.expm1(0.1)))
                 self.noise_proj.bias.data[1::2].fill_(math.log(math.expm1(1.0)))
+        else:
+            self.rotation_proj = None
         if bayes_features != "paper" or not self.fuse_paper_qkv:
-            self.q_proj = factory.linear(width, width)
-            self.k_proj = factory.linear(width, width)
+            qk_width = width // 2 if bayes_dynamics == "rotation" else width
+            self.q_proj = factory.linear(width, qk_width)
+            self.k_proj = factory.linear(width, qk_width)
             self.v_proj = factory.linear(width, width)
         self.out_proj = factory.linear(width, width)
         self.read_norm = factory.rms_norm(self.head_dim)
@@ -411,11 +448,23 @@ class BayesianMixer(nn.Module):
         q_projected = q_input if self.bayes_features == "paper" else self.q_proj(q_input)
         k_projected = k_input if self.bayes_features == "paper" else self.k_proj(k_input)
         v_projected = v_input if self.bayes_features == "paper" else self.v_proj(v_input)
-        q = F.silu(q_projected.float()).view(b, t, self.heads, self.head_dim)
-        k = F.silu(k_projected.float()).view(b, t, self.heads, self.head_dim)
+        q = F.silu(q_projected.float()).view(b, t, self.heads, -1)
+        k = F.silu(k_projected.float()).view(b, t, self.heads, -1)
         v = F.silu(v_projected.float()).view(b, t, self.heads, self.head_dim)
-        q = F.normalize(q, dim=-1).permute(0, 2, 1, 3)
-        k = F.normalize(k, dim=-1).permute(0, 2, 1, 3)
+        q = F.normalize(q, dim=-1)
+        k = F.normalize(k, dim=-1)
+        if self.bayes_dynamics == "rotation":
+            # Paper embedding: each scalar key/query occupies the first
+            # coordinate of a 2-D rotational state pair.
+            q = torch.stack((q, torch.zeros_like(q)), dim=-1).reshape(
+                b, t, self.heads, self.head_dim
+            ).permute(0, 2, 1, 3)
+            k = torch.stack((k, torch.zeros_like(k)), dim=-1).reshape(
+                b, t, self.heads, self.head_dim
+            ).permute(0, 2, 1, 3)
+        else:
+            q = q.permute(0, 2, 1, 3)
+            k = k.permute(0, 2, 1, 3)
         v = v.permute(0, 2, 1, 3)
         shape = (b * self.heads, t, self.head_dim)
         q, k, v = (value.reshape(shape) for value in (q, k, v))
@@ -429,7 +478,17 @@ class BayesianMixer(nn.Module):
             observation = F.softplus(noise[..., 1]) + 1e-4
             process = process.permute(0, 2, 1).reshape(b * self.heads, t)
             observation = observation.permute(0, 2, 1).reshape(b * self.heads, t)
-            if self.decay_proj is None and not (
+            if self.bayes_dynamics == "rotation":
+                process = process[..., None].expand(
+                    b * self.heads, t, self.head_dim // 2
+                )
+                rotation = self.rotation_proj(z).float().view(b, t, self.heads, 2, self.head_dim // 2)
+                rotation_decay = torch.exp(-F.softplus(rotation[..., 0, :]))
+                rotation_angle = rotation[..., 1, :]
+                rotation_decay = rotation_decay.reshape(b * self.heads, t, self.head_dim // 2)
+                rotation_angle = rotation_angle.reshape(b * self.heads, t, self.head_dim // 2)
+                decay = None
+            elif self.decay_proj is None and not (
                 self.fuse_paper_projection and self.bayes_dynamics == "learned"
             ):
                 decay = torch.ones(
@@ -457,15 +516,18 @@ class BayesianMixer(nn.Module):
             decay = self.decay.expand(b * self.heads, t, self.head_dim)
             process = self.process_variance
             observation = self.observation_variance
-        read, _, _ = bayesian_layer(
-            k, v, q,
-            transition_diagonals=decay,
+        layer_kwargs = dict(
             process_variances=process,
             observation_variances=observation,
             chunk_length=self.chunk_length,
             optimized=self.optimized,
             fixed_dynamics=self.bayes_features == "fixed",
         )
+        if self.bayes_dynamics == "rotation":
+            layer_kwargs.update(rotation_radii=rotation_decay, rotation_angles=rotation_angle)
+        else:
+            layer_kwargs.update(transition_diagonals=decay)
+        read, _, _ = bayesian_layer(k, v, q, **layer_kwargs)
         read = read.view(b, self.heads, t, self.head_dim).permute(0, 2, 1, 3)
         # RMSNorm's parameter dtype follows the projection path. Cast at the
         # state boundary so BF16 runs do not invoke a mixed-dtype fallback;
@@ -923,12 +985,15 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         "fused_rmsnorm": bool(args.fused_rmsnorm),
         "compile_components": args.compile_components,
         "bayesian_core": (
-            "exact dense covariance; Inductor diagonal-transition"
-            if optimized and args.bayes_features == "paper"
+            "exact dense covariance; fused CUDA chunk replay"
+            if optimized and args.bayes_backend == "fused"
             else (
-                "exact dense covariance; fused CUDA chunk replay"
-                if optimized and os.environ.get("BAYES_SSM_DISABLE_FUSED_CUDA", "0") != "1"
-                else ("exact dense covariance; Inductor fallback" if optimized else "exact dense covariance; eager")
+                "exact dense covariance; Inductor diagonal-transition"
+                if optimized and args.bayes_backend == "inductor" and args.bayes_features == "paper"
+                else (
+                    "exact dense covariance; Inductor fallback"
+                    if optimized else "exact dense covariance; eager"
+                )
             )
         ),
         "bayes_backend_requested": args.bayes_backend,
@@ -986,8 +1051,8 @@ def main() -> None:
         help="Bayesian mixer features (default: paper; fixed is the old fast benchmark path)",
     )
     parser.add_argument(
-        "--bayes-dynamics", choices=("learned", "identity"), default="learned",
-        help="paper mode dynamics: input-dependent learned diagonal decay or identity",
+        "--bayes-dynamics", choices=("learned", "identity", "rotation"), default="learned",
+        help="paper dynamics: learned diagonal decay, identity, or damped 2-D rotation",
     )
     parser.add_argument(
         "--paper-fused-qkv", dest="fuse_paper_qkv",
