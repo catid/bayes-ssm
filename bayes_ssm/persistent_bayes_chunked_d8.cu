@@ -491,9 +491,9 @@ __global__ void fused_backward_chunk_kernel(
     for(int x=tid;x<D*M;x+=THREADS){int i=x/M,c=x%M;gMprev[x]=gM[x]-k[i]*ge[c];}
     for(int i=tid;i<D;i+=THREADS){float z=0;for(int c=0;c<M;++c)z+=mp0[i*M+c]*ge[c];gk[i]=-z;}
     __syncthreads();
-    float z=0;for(int x=tid;x<D*D;x+=THREADS){int i=x/D,j=x%D;if(i<=j){float r=.5f*(gC[x]+gC[j*D+i]);z-=r*uh[i]*uh[j]*(i==j?1.0f:2.0f);}}for(int x=tid;x<D*M;x+=THREADS){int i=x/M,c=x%M;z+=gM[x]*uh[i]*e[c];}red[tid]=z;__syncthreads();
-    for(int off=THREADS/2;off>0;off>>=1){if(tid<off)red[tid]+=red[tid+off];__syncthreads();}
-    if(tid==0){float s=rv;for(int i=0;i<D;++i)s+=k[i]*uh[i];scalars[0]=red[0];scalars[1]=(s>floor)?-red[0]*beta*beta:0.f;if constexpr(NEED_DYNAMICS)gobservation[(size_t)b*t+ti]=scalars[1];}
+    float z=0;for(int x=tid;x<D*D;x+=THREADS){int i=x/D,j=x%D;if(i<=j){float r=.5f*(gC[x]+gC[j*D+i]);z-=r*uh[i]*uh[j]*(i==j?1.0f:2.0f);}}for(int x=tid;x<D*M;x+=THREADS){int i=x/M,c=x%M;z+=gM[x]*uh[i]*e[c];}
+    const float total = block_sum_d8<THREADS>(z, red);
+    if(tid==0){float s=rv;for(int i=0;i<D;++i)s+=k[i]*uh[i];scalars[0]=total;scalars[1]=(s>floor)?-total*beta*beta:0.f;if constexpr(NEED_DYNAMICS)gobservation[(size_t)b*t+ti]=scalars[1];}
     __syncthreads(); const float gs=scalars[1];
     for(int i=tid;i<D;i+=THREADS){float a=0,bv=0;for(int c=0;c<M;++c)a+=gM[i*M+c]*e[c];for(int j=0;j<D;++j){float r=.5f*(gC[i*D+j]+gC[j*D+i]);bv+=2.f*r*uh[j];}gu[i]=beta*(a-bv)+gs*k[i];gk[i]+=gs*uh[i];}
     __syncthreads();
@@ -505,7 +505,7 @@ __global__ void fused_backward_chunk_kernel(
     __syncthreads();
     if constexpr(NEED_DYNAMICS){
       for(int i=tid;i<D;i+=THREADS){float zd=0,zm=0;const float inv_di=1.0f/d[i];for(int j=0;j<D;++j){int pi=j<i?j:i;int pj=j<i?i:j;float cpv;if(li==0)cpv=cov_prev[i*D+j];else cpv=pp_prev[pi*D+pj]-beta_prev*uh_prev[i]*uh_prev[j];zd+=(gCprev[i*D+j]+gCprev[j*D+i])*cpv*inv_di;}for(int c=0;c<M;++c){float mv;if(li==0)mv=mean_prev[i*M+c];else mv=mp_prev[i*M+c]+beta_prev*uh_prev[i]*eh_prev[c];zm+=gMprev[i*M+c]*mv;}gdecay[((size_t)b*t+ti)*D+i]=zd+zm;}
-      float pz=0;for(int i=tid;i<D;i+=THREADS){float inv_di=1.0f/d[i];pz+=gCprev[i*D+i]*inv_di*inv_di;}red[tid]=pz;__syncthreads();for(int off=THREADS/2;off>0;off>>=1){if(tid<off)red[tid]+=red[tid+off];__syncthreads();}if(tid==0)gprocess[(size_t)b*t+ti]=red[0];
+      float pz=0;for(int i=tid;i<D;i+=THREADS){float inv_di=1.0f/d[i];pz+=gCprev[i*D+i]*inv_di*inv_di;}const float total_p=block_sum_d8<THREADS>(pz, red);if(tid==0)gprocess[(size_t)b*t+ti]=total_p;
     }
     for(int x=tid;x<D*M;x+=THREADS){int i=x/M;gM[x]=gMprev[x]*d[i];}
     for(int x=tid;x<D*D;x+=THREADS)gC[x]=gCprev[x];
