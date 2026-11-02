@@ -118,10 +118,15 @@ class _ChunkedBayesianFunction(torch.autograd.Function):
             )
             (output, final_mean, final_covariance, boundary_mean,
              boundary_covariance) = result
-        # The clones make the returned tensors independent of extension-owned
-        # graph-pool storage during CUDA graph replay.  Boundary tensors remain
-        # saved and are consumed by the matching reverse kernel in the same
-        # captured step.
+        # The extension returns ordinary PyTorch tensors allocated on the
+        # current stream.  Do not clone them here: a clone adds a full
+        # read/write pass over the [N,T,M] readout on every training step (and
+        # another pass over the final state), which is especially expensive for
+        # the large six-layer envelope.  CUDA-graph replay is safe because the
+        # forward output is consumed by the captured backward before the next
+        # replay, and the boundary/history tensors below already remain in the
+        # extension-owned graph pool.  Keeping the original tensors also makes
+        # this path consistent with the saved-history ABI.
         # Save exactly the contiguous buffers passed to the extension.  The
         # projected [B,H,T,D] tensors are commonly reshaped views; saving the
         # original views would make the reverse kernel's flat indexing read
@@ -163,7 +168,7 @@ class _ChunkedBayesianFunction(torch.autograd.Function):
         # state/dynamics-gradient work while preserving full gradients when a
         # caller uses either final state.
         ctx.set_materialize_grads(False)
-        return output.clone(), final_mean.clone(), final_covariance.clone()
+        return output, final_mean, final_covariance
 
     @staticmethod
     def backward(ctx, grad_output, grad_mean, grad_covariance):
