@@ -31,7 +31,7 @@ python example/train_6layer.py --device cuda:0 --precision bf16 \
   --bayes-backend inductor --bayes-features paper --bayes-dynamics learned \
   --cuda-graph --gpu-batch-staging --width 512 --heads 64 --kv-heads 4 \
   --mlp-width 8448 --seq 512 --batch 256 --steps 60 --warmup 20 \
-  --output bayes_paper.json
+  --paper-fused-qkv --paper-fused-projection --output bayes_paper.json
 ```
 
 The parameter-matched Mamba-3/GQA run uses the same six-layer layout, optimizer,
@@ -53,20 +53,22 @@ projections, TE fused RMSNorm, a 32k tied vocabulary head, GQA in blocks 3 and
 the exact dense-covariance recurrence with the paper's causal Q/K/V short
 convolutions, input-dependent process/observation noise, and input-dependent
 diagonal transitions. The first run pays one-time compilation cost; it is not
-included in the timed 60 steps. The raw records are [Bayesian](example/results/gb300_6layer_bayes_paper.json)
-and [Mamba-3](example/results/gb300_6layer_mamba3_paper_match.json).
+included in the timed 60 steps. The raw records are [Bayesian](example/results/gb300_6layer_bayes_paper_fusedproj.json)
+and [Mamba-3](example/results/gb300_6layer_mamba3_paper_match_v2.json). The
+validation pass uses 64 sequences per GPU after timing to keep the post-run
+evaluation within available memory; this does not change the timed batch.
 
 | Model | Parameters | Mixer layout | Batch × sequence / GPU | Throughput (global / per GPU) | Peak VRAM allocated / reserved / rank | Validation loss / PPL |
 |---|---:|---|---:|---:|---:|---:|
-| Bayesian paper path | **101.942M** | Bayes, Bayes, GQA, Bayes, Bayes, GQA | 256 × 512 | **437,376 / 218,688 tok/s** | **149,228 / 191,220 MiB** | 10.3806 / 32,228 |
-| Mamba-3 matched hybrid | **101.944M** | Mamba-3, Mamba-3, GQA, Mamba-3, Mamba-3, GQA | 256 × 512 | **998,046 / 499,023 tok/s** | **119,268 / 165,628 MiB** | 10.3488 / 31,219 |
+| Bayesian paper path | **101.942M** | Bayes, Bayes, GQA, Bayes, Bayes, GQA | 256 × 512 | **458,489 / 229,245 tok/s** | **147,033 / 189,412 MiB** | 10.3835 / 32,321 |
+| Mamba-3 matched hybrid | **101.944M** | Mamba-3, Mamba-3, GQA, Mamba-3, Mamba-3, GQA | 256 × 512 | **1,218,503 / 609,251 tok/s** | **119,268 / 133,256 MiB** | 10.3623 / 31,645 |
 
-The recurrent state and covariance remain FP32. The paper path is about 2.28×
-slower and uses about 25% more allocated VRAM than this Mamba-3 baseline at
+The recurrent state and covariance remain FP32. The paper path is about 2.66×
+slower and uses about 23% more allocated VRAM than this Mamba-3 baseline at
 this shape; that cost is the exact dynamic dense-covariance computation, not a
 fixed-dynamics approximation.
 
-Use `--bayes-backend fused` when the lower-memory custom CUDA replay path is preferred; `inductor` with the fixed scalar dynamics is the fastest measured backend for the recorded shape.
+Use `--bayes-backend fused` when the lower-memory custom CUDA replay path is preferred. The recorded paper-feature result uses the Inductor backend with learned input-dependent dynamics; backend rankings can change with sequence length and batch shape.
 
 The validation stream is synthetic random data, so its loss is a health check rather than a language-quality claim.
 
