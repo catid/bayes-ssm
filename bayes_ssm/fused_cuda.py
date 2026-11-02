@@ -261,10 +261,21 @@ class _ChunkedBayesianFunction(torch.autograd.Function):
                 return (*gradients, None, None, None, None, None, None, None, None)
             return (*gradients, None, None, None)
         if lean_backward:
+            # The CUDA lean entry points still keep the full ABI: they accept
+            # final-mean/final-covariance gradients even though the specialized
+            # kernel does not propagate them or return dynamics/state grads.
+            # Supplying no tensors here used to shift ``chunk_length`` into
+            # the ``gmf`` slot and raised a pybind argument error whenever a
+            # caller used the common readout-only path with detached dynamics.
+            # Zero buffers are cheap relative to replay and make the ABI
+            # explicit for both dynamic and fixed kernels.
+            zero_gm = torch.zeros(ctx.mean_shape, device=device, dtype=keys.dtype)
+            zero_gc = torch.zeros(ctx.covariance_shape, device=device, dtype=keys.dtype)
             gradients = backward(
                 keys, values, queries, decay, process, observation,
                 initial_mean, initial_covariance, boundary_mean, boundary_covariance,
-                grad_output, ctx.chunk_length, ctx.denominator_floor,
+                grad_output, zero_gm, zero_gc,
+                ctx.chunk_length, ctx.denominator_floor,
             )
             # Three tensor gradients plus five tensor and three scalar
             # non-differentiable inputs = eleven backward slots.
