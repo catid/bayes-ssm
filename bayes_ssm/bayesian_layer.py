@@ -383,14 +383,16 @@ def _core_loop_fixed_diagonal(
             predicted_mean * key[..., :, None], dim=-2
         )
         mean = predicted_mean + beta[..., None, None] * uncertainty_key[..., :, None] * innovation[..., None, :]
-        # Every term is symmetric for scalar rho, isotropic process noise, and
-        # the rank-one Kalman update.  Skipping a transpose average removes a
-        # full D×D pass while preserving the FP32 covariance state.
+        # Keep the reference graph identical to the fused CUDA recurrence:
+        # both explicitly symmetrize the dense covariance after the rank-one
+        # update.  This costs only a small D×D pass in the compiled oracle and
+        # makes its initial-covariance gradients match the production kernel.
         covariance = (
             rho2 * covariance
             + process * eye
             - beta[..., None, None] * uncertainty_key[..., :, None] * uncertainty_key[..., None, :]
         )
+        covariance = (covariance + covariance.transpose(-1, -2)) * 0.5
         outputs.append(torch.sum(mean * queries[..., i, :, None], dim=-2))
     return torch.stack(outputs, dim=-2), mean, covariance
 
