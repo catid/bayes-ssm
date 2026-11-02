@@ -299,7 +299,15 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             "sequence_length": args.seq,
             "batch_per_rank": args.batch,
         },
-        "world_size": world_size, "rank": rank, "precision": "BF16 projections + TransformerEngine fused RMSNorm with FP32 tied vocabulary head" if args.fused_rmsnorm else "BF16",
+        "world_size": world_size, "rank": rank,
+        "precision": (
+            "TE FP8 projections + TransformerEngine fused RMSNorm with FP32 tied vocabulary head"
+            if factory.active == "te-fp8" and args.fused_rmsnorm else
+            "TE FP8 projections with FP32 tied vocabulary head"
+            if factory.active == "te-fp8" else
+            "BF16 projections + TransformerEngine fused RMSNorm with FP32 tied vocabulary head"
+            if args.fused_rmsnorm else "BF16"
+        ),
         "optimizer": "capturable fused AdamW", "cuda_graph": bool(args.cuda_graph), "gpu_batch_staging": bool(gpu_batches is not None), "compile_ffn": bool(args.compile_ffn), "compile_gqa": bool(args.compile_ffn and args.mixer == "hybrid"), "chunk_size": 64,
         "timed_steps": args.steps, "warmup_steps": args.warmup, "validation_batch_per_rank": validation_batch, "dataset": "synthetic random token stream (seed 123)",
         "tokens_per_second_global": args.steps * args.batch * args.seq * world_size / elapsed if elapsed else float("inf"),
