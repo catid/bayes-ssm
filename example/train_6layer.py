@@ -146,6 +146,34 @@ class GQAAttention(nn.Module):
         return self.out_proj(y)
 
 
+class CausalDepthwiseConv(nn.Module):
+    """Compile-friendly causal depthwise short convolution.
+
+    The paper uses independent length-four causal filters for Q, K, and V.
+    ``Conv1d(groups=C)`` is mathematically exact but launches a separate
+    depthwise convolution kernel around every small TE projection.  Expressing
+    the same operation as an unfold and channelwise reduction lets Inductor
+    fuse the pad, multiply, and sum into the surrounding Bayesian envelope.
+    The parameter layout intentionally matches ``Conv1d(C,C,groups=C)`` so
+    existing checkpoints load unchanged.
+    """
+
+    def __init__(self, channels: int, kernel_size: int = 4, *, dtype: torch.dtype):
+        super().__init__()
+        self.channels = int(channels)
+        self.kernel_size = int(kernel_size)
+        self.weight = nn.Parameter(torch.empty(channels, 1, kernel_size, dtype=dtype))
+        nn.init.zeros_(self.weight)
+        with torch.no_grad():
+            self.weight[:, 0, -1] = 1
+
+    def forward(self, x: Tensor) -> Tensor:
+        windows = F.pad(x, (self.kernel_size - 1, 0)).unfold(
+            -1, self.kernel_size, 1
+        )
+        return (windows * self.weight[:, 0, :].view(1, self.channels, 1, self.kernel_size)).sum(-1)
+
+
 class BayesianMixer(nn.Module):
     def __init__(
         self,
@@ -258,31 +286,14 @@ class BayesianMixer(nn.Module):
                         torch.zeros(self.aux_width, dtype=factory.dtype,
                                     device=self.qkv_proj.weight.device)
                     )
-                self.qkv_conv = nn.Conv1d(
-                    2 * self.state_width + width, 2 * self.state_width + width, kernel_size=4,
-                    groups=2 * self.state_width + width, bias=False, dtype=factory.dtype,
+                self.qkv_conv = CausalDepthwiseConv(
+                    2 * self.state_width + width, kernel_size=4, dtype=factory.dtype
                 )
-                nn.init.zeros_(self.qkv_conv.weight)
-                with torch.no_grad():
-                    self.qkv_conv.weight[:, 0, -1] = 1
             else:
                 qk_width = self.state_width // 2 if bayes_dynamics == "rotation" else self.state_width
-                self.q_conv = nn.Conv1d(
-                    qk_width, qk_width, kernel_size=4, groups=qk_width, bias=False,
-                    dtype=factory.dtype,
-                )
-                self.k_conv = nn.Conv1d(
-                    qk_width, qk_width, kernel_size=4, groups=qk_width, bias=False,
-                    dtype=factory.dtype,
-                )
-                self.v_conv = nn.Conv1d(
-                    width, width, kernel_size=4, groups=width, bias=False,
-                    dtype=factory.dtype,
-                )
-                for conv in (self.q_conv, self.k_conv, self.v_conv):
-                    nn.init.zeros_(conv.weight)
-                    with torch.no_grad():
-                        conv.weight[:, 0, -1] = 1
+                self.q_conv = CausalDepthwiseConv(qk_width, kernel_size=4, dtype=factory.dtype)
+                self.k_conv = CausalDepthwiseConv(qk_width, kernel_size=4, dtype=factory.dtype)
+                self.v_conv = CausalDepthwiseConv(width, kernel_size=4, dtype=factory.dtype)
             # The paper parameterizes positive input-dependent process and
             # observation variances with softplus. Per-head scalars preserve
             # the exact dense covariance while avoiding a large extra head-D
