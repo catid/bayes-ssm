@@ -88,7 +88,11 @@ class _ChunkedBayesianFunction(torch.autograd.Function):
         # chunk_length; callers retain identical outputs and gradients while
         # avoiding the known multi-chunk reverse-state synchronization path.
         use_saved_history = (
-            os.environ.get("BAYES_SSM_DISABLE_SAVED_HISTORY", "0") != "1"
+            # The opt-out remains available for full-chunk microbenchmarks,
+            # but never routes D1 partial chunks through the known-unsafe
+            # generic recompute path.
+            (os.environ.get("BAYES_SSM_DISABLE_SAVED_HISTORY", "0") != "1"
+             or int(chunk_length) < int(t))
             and not fixed_dynamics
             and keys.shape[-1] == 1
             and hasattr(extension, "forward_chunked_saved")
