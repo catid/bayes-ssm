@@ -307,7 +307,10 @@ __global__ void backward_chunk_kernel(
    if constexpr (!FIXED) {
      for(int x=tid;x<D*M;x+=THREADS){int i=x/M,c=x%M;gMprev[x]=gM[x]-k[i]*ge[c];}
    }
-   for(int i=tid;i<D;i+=THREADS){float z=0;for(int c=0;c<M;++c)z+=mp0[i*M+c]*ge[c];gk[i]=-z;}sync_threads_d4<THREADS>();
+   // gk is only written to global memory at the end of the token.  The
+   // following covariance/readout adjoints do not consume it, so no barrier
+   // is needed between this independent row work and the scalar reduction.
+   for(int i=tid;i<D;i+=THREADS){float z=0;for(int c=0;c<M;++c)z+=mp0[i*M+c]*ge[c];gk[i]=-z;}
    float z=0;for(int x=tid;x<D*D;x+=THREADS){int i=x/D,j=x%D;if(i<=j){float r=.5f*(gC[x]+gC[j*D+i]);z-=r*u[i]*u[j]*(i==j?1.0f:2.0f);}}for(int x=tid;x<D*M;x+=THREADS){int i=x/M,c=x%M;z+=gM[x]*u[i]*e[c];}z=warp_sum_d4(z);
    if(tid==0){float s=rv;for(int i=0;i<D;++i)s+=k[i]*u[i];scalars[group][0]=z;scalars[group][1]=(s>floor)?-z*beta*beta:0.f;
      if constexpr (NEED_DYNAMICS && !FIXED) gobservation[(size_t)b*t+ti]=scalars[group][1];
