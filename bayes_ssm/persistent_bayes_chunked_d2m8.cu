@@ -2,6 +2,7 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <cuda.h>
 #include <cuda_runtime.h>
+#include <cstdlib>
 
 namespace {
 
@@ -339,6 +340,112 @@ __global__ void backward_chunk_kernel(
  }
  for(int x=tid;x<D*M;x+=THREADS)gm_state[b*D*M+x]=gM[x];for(int x=tid;x<D*D;x+=THREADS)gc_state[b*D*D+x]=gC[x];
 }
+
+template<int D,int M,int THREADS,bool NEED_DYNAMICS,int GROUPS=1>
+__global__ void fused_backward_chunk_kernel(
+ const float* __restrict__ keys,const float* __restrict__ values,const float* __restrict__ queries,
+ const float* __restrict__ decay,const float* __restrict__ process,const float* __restrict__ observation,
+ const float* __restrict__ bmean,const float* __restrict__ bcov,
+ const float* __restrict__ gy,
+ float* __restrict__ gkeys,float* __restrict__ gvalues,float* __restrict__ gqueries,
+ float* __restrict__ gdecay,float* __restrict__ gprocess,float* __restrict__ gobservation,
+ float* __restrict__ gm_state,float* __restrict__ gc_state,
+ int n,int t,int chunks,int nb,int ci,float floor) {
+  const int tid0=threadIdx.x;
+  const int group=tid0/THREADS;
+  const int tid=tid0%THREADS;
+  const int b=blockIdx.x*GROUPS+group;
+  if (b>=n) return;
+  const unsigned group_mask=0xffffffffu;
+  extern __shared__ float sm[];
+  constexpr int BASE=3*D*M+3*D*D+3*D+2*M+THREADS;
+  constexpr int HIST=D*M+D*D+D+M+1;
+  float* sm_base=sm+(size_t)group*(BASE+(size_t)chunks*HIST);
+  float* mean=sm_base; float* cov=mean+D*M;
+  float* u=cov+D*D; float* err=u+D; float* gM=err+M;
+  float* gC=gM+D*M; float* gMprev=gC+D*D; float* gCprev=gMprev+D*M;
+  float* ge=gCprev+D*D; float* gu=ge+M; float* gk=gu+D;
+  float* red=gk+D;
+  float* hmp=red+THREADS;
+  float* hpp=hmp+(size_t)chunks*D*M;
+  float* huh=hpp+(size_t)chunks*D*D;
+  float* hbh=huh+(size_t)chunks*D;
+  float* heh=hbh+chunks;
+  __shared__ float scalars[GROUPS][3];
+  const int start=ci*chunks, len=min(chunks,t-start);
+  const size_t bo=((size_t)b*(nb+1)+ci);
+  for(int x=tid;x<D*M;x+=THREADS){mean[x]=bmean[bo*D*M+x];gM[x]=gm_state[(size_t)b*D*M+x];}
+  for(int x=tid;x<D*D;x+=THREADS){cov[x]=bcov[bo*D*D+x];gC[x]=gc_state[(size_t)b*D*D+x];}
+  sync_threads_d2<THREADS>(0xffffu << (group*16));
+  // Replay the forward recurrence and retain exactly the values consumed by
+  // the reverse equations below.
+  for(int li=0;li<len;++li){
+    const int ti=start+li;
+    const float* k=keys+((size_t)b*t+ti)*D;
+    const float* v=values+((size_t)b*t+ti)*M;
+    const float* d=decay+((size_t)b*t+ti)*D;
+    float pv=process[(size_t)b*t+ti], rv=observation[(size_t)b*t+ti];
+    float* hpp_t=hpp+(size_t)li*D*D;
+    for(int x=tid;x<D*D;x+=THREADS){int i=x/D,j=x%D;hpp_t[x]=cov[i*D+j]*d[i]*d[j]+(i==j?pv:0.f);}
+    sync_threads_d2<THREADS>(0xffffu << (group*16));
+    for(int i=tid;i<D;i+=THREADS){float z=0.f;for(int j=0;j<D;++j)z+=cov[i*D+j]*d[j]*k[j];u[i]=d[i]*z+pv*k[i];}
+    sync_threads_d2<THREADS>(0xffffu << (group*16));
+    if(tid==0){float z=rv;for(int i=0;i<D;++i)z+=k[i]*u[i];scalars[group][0]=fmaxf(z,floor);hbh[li]=1.f/scalars[group][0];}
+    for(int c=tid;c<M;c+=THREADS){float z=0.f;for(int i=0;i<D;++i)z+=d[i]*mean[i*M+c]*k[i];err[c]=v[c]-z;}
+    sync_threads_d2<THREADS>(0xffffu << (group*16));
+    const float beta=hbh[li];
+    for(int x=tid;x<D*M;x+=THREADS){int i=x/M;hmp[(size_t)li*D*M+x]=d[i]*mean[x];heh[(size_t)li*M+(x%M)]=err[x%M];}
+    for(int i=tid;i<D;i+=THREADS)huh[(size_t)li*D+i]=u[i];
+    for(int x=tid;x<D*M;x+=THREADS){int i=x/M,c=x%M;mean[x]=d[i]*mean[x]+beta*u[i]*err[c];}
+    sync_threads_d2<THREADS>(0xffffu << (group*16));
+    for(int x=tid;x<D*D;x+=THREADS){int i=x/D,j=x%D;if(i<=j){float z=hpp_t[x]-beta*u[i]*u[j];cov[i*D+j]=z;cov[j*D+i]=z;}}
+    sync_threads_d2<THREADS>(0xffffu << (group*16));
+  }
+  // Reverse replay.  Keep the arithmetic aligned with the validated dynamic
+  // D4 kernel, including the full asymmetric input-covariance derivative.
+  for(int li=len-1;li>=0;--li){
+    const int ti=start+li;
+    const float* k=keys+((size_t)b*t+ti)*D;
+    const float* q=queries+((size_t)b*t+ti)*D;
+    const float* d=decay+((size_t)b*t+ti)*D;
+    const float* mp0=hmp+(size_t)li*D*M; const float* pp0=hpp+(size_t)li*D*D;
+    const float* uh=huh+(size_t)li*D; const float* e=heh+(size_t)li*M; const float beta=hbh[li];
+    const float* gyt=gy+((size_t)b*t+ti)*M; const float rv=observation[(size_t)b*t+ti];
+    for(int i=tid;i<D;i+=THREADS){float z=0;for(int c=0;c<M;++c)z+=(mp0[i*M+c]+beta*uh[i]*e[c])*gyt[c];gqueries[((size_t)b*t+ti)*D+i]=z;}
+    for(int x=tid;x<D*M;x+=THREADS){int i=x/M,c=x%M;gM[x]+=q[i]*gyt[c];}
+    sync_threads_d2<THREADS>(0xffffu << (group*16));
+    for(int c=tid;c<M;c+=THREADS){float z=0;for(int i=0;i<D;++i)z+=gM[i*M+c]*uh[i];ge[c]=beta*z;gvalues[((size_t)b*t+ti)*M+c]=ge[c];}
+    sync_threads_d2<THREADS>(0xffffu << (group*16));
+    for(int x=tid;x<D*M;x+=THREADS){int i=x/M,c=x%M;gMprev[x]=gM[x]-k[i]*ge[c];}
+    for(int i=tid;i<D;i+=THREADS){float z=0;for(int c=0;c<M;++c)z+=mp0[i*M+c]*ge[c];gk[i]=-z;}
+    sync_threads_d2<THREADS>(0xffffu << (group*16));
+    float z=0;
+    for(int x=tid;x<D*D;x+=THREADS){int i=x/D,j=x%D;if(i<=j){float r=.5f*(gC[x]+gC[j*D+i]);z-=r*uh[i]*uh[j]*(i==j?1.0f:2.0f);}}
+    for(int x=tid;x<D*M;x+=THREADS){int i=x/M,c=x%M;z+=gM[x]*uh[i]*e[c];}
+    const float total=warp_sum_d2(z, 0xffffu << (group*16));
+    if(tid==0){float s=rv;for(int i=0;i<D;++i)s+=k[i]*uh[i];scalars[group][0]=total;scalars[group][1]=(s>floor)?-total*beta*beta:0.f;if constexpr(NEED_DYNAMICS)gobservation[(size_t)b*t+ti]=scalars[group][1];}
+    sync_threads_d2<THREADS>(0xffffu << (group*16)); const float gs=scalars[group][1];
+    for(int i=tid;i<D;i+=THREADS){float a=0,bv=0;for(int c=0;c<M;++c)a+=gM[i*M+c]*e[c];for(int j=0;j<D;++j){float r=.5f*(gC[i*D+j]+gC[j*D+i]);bv+=2.f*r*uh[j];}gu[i]=beta*(a-bv)+gs*k[i];gk[i]+=gs*uh[i];}
+    sync_threads_d2<THREADS>(0xffffu << (group*16));
+    for(int i=tid;i<D;i+=THREADS){float zz=0;for(int j=0;j<D;++j){int pi=j<i?j:i;int pj=j<i?i:j;zz+=pp0[pi*D+pj]*gu[j];}gk[i]+=zz;}
+    for(int x=tid;x<D*D;x+=THREADS){int i=x/D,j=x%D;float r=.5f*(gC[x]+gC[j*D+i]);gCprev[x]=(r+gu[i]*k[j])*d[i]*d[j];}
+    sync_threads_d2<THREADS>(0xffffu << (group*16));
+    const float* mean_prev; const float* cov_prev; const float* mp_prev=nullptr; const float* pp_prev=nullptr; const float* uh_prev=nullptr; const float* eh_prev=nullptr; float beta_prev=0;
+    if(li==0){mean_prev=bmean+((size_t)b*(nb+1)+ci)*D*M;cov_prev=bcov+((size_t)b*(nb+1)+ci)*D*D;}
+    else{mp_prev=hmp+(size_t)(li-1)*D*M;pp_prev=hpp+(size_t)(li-1)*D*D;uh_prev=huh+(size_t)(li-1)*D;eh_prev=heh+(size_t)(li-1)*M;beta_prev=hbh[li-1];}
+    sync_threads_d2<THREADS>(0xffffu << (group*16));
+    if constexpr(NEED_DYNAMICS){
+      for(int i=tid;i<D;i+=THREADS){float zd=0,zm=0;const float inv_di=1.0f/d[i];for(int j=0;j<D;++j){int pi=j<i?j:i;int pj=j<i?i:j;float cpv;if(li==0)cpv=cov_prev[i*D+j];else cpv=pp_prev[pi*D+pj]-beta_prev*uh_prev[i]*uh_prev[j];zd+=(gCprev[i*D+j]+gCprev[j*D+i])*cpv*inv_di;}for(int c=0;c<M;++c){float mv;if(li==0)mv=mean_prev[i*M+c];else mv=mp_prev[i*M+c]+beta_prev*uh_prev[i]*eh_prev[c];zm+=gMprev[i*M+c]*mv;}gdecay[((size_t)b*t+ti)*D+i]=zd+zm;}
+      float pz=0;for(int i=tid;i<D;i+=THREADS){float inv_di=1.0f/d[i];pz+=gCprev[i*D+i]*inv_di*inv_di;}const float total_p=warp_sum_d2(pz, 0xffffu << (group*16));if(tid==0)gprocess[(size_t)b*t+ti]=total_p;
+    }
+    for(int x=tid;x<D*M;x+=THREADS){int i=x/M;gM[x]=gMprev[x]*d[i];}
+    for(int x=tid;x<D*D;x+=THREADS)gC[x]=gCprev[x];
+    for(int i=tid;i<D;i+=THREADS)gkeys[((size_t)b*t+ti)*D+i]=gk[i];
+    sync_threads_d2<THREADS>(0xffffu << (group*16));
+  }
+  for(int x=tid;x<D*M;x+=THREADS)gm_state[(size_t)b*D*M+x]=gM[x];
+  for(int x=tid;x<D*D;x+=THREADS)gc_state[(size_t)b*D*D+x]=gC[x];
+}
 }
 
 std::vector<torch::Tensor> forward_chunked(
@@ -377,6 +484,44 @@ std::vector<torch::Tensor> backward_chunked_impl(
  }
  auto gm=torch::empty_like(mean0),gc=torch::empty_like(cov0);
  gm.copy_(gmf); gc.copy_(gcf);
+ // Optional fused replay keeps the complete D2/M8 history on chip and
+ // combines recompute plus reverse into one launch per chunk.  It preserves
+ // learned diagonal dynamics, process noise, observation noise, and their
+ // exact gradients.  The regular global-history path remains the default.
+ const char* fused_replay_env = std::getenv("BAYES_SSM_FUSED_REPLAY");
+ if constexpr (!FIXED) if (chunks <= 512 && fused_replay_env && fused_replay_env[0] == '1') {
+   constexpr int fth = 16;
+   constexpr int fgroups = 2;
+   // D2/M8 base workspace is 98 floats; each replay token stores 31 floats.
+   const size_t shared_bytes = (size_t)fgroups * (98 + (size_t)chunks * 31) * sizeof(float);
+   cudaFuncSetAttribute(
+       fused_backward_chunk_kernel<2,8,fth,NEED_DYNAMICS,fgroups>,
+       cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(shared_bytes));
+   auto fused_stream = at::cuda::getCurrentCUDAStream();
+   float *gd_ptr=nullptr,*gp_ptr=nullptr,*gr_ptr=nullptr;
+   if constexpr (NEED_DYNAMICS) {
+     gd_ptr=gd.data_ptr<float>(); gp_ptr=gp.data_ptr<float>(); gr_ptr=gr.data_ptr<float>();
+   }
+   for (int ci=nb-1; ci>=0; --ci) {
+     fused_backward_chunk_kernel<2,8,fth,NEED_DYNAMICS,fgroups>
+       <<< (n+fgroups-1)/fgroups, fgroups*fth, shared_bytes, fused_stream >>>(
+         keys.data_ptr<float>(), values.data_ptr<float>(), queries.data_ptr<float>(),
+         decay.data_ptr<float>(), process.data_ptr<float>(), observation.data_ptr<float>(),
+         bm.data_ptr<float>(), bc.data_ptr<float>(), gy.data_ptr<float>(),
+         gk.data_ptr<float>(), gv.data_ptr<float>(), gq.data_ptr<float>(),
+         gd_ptr, gp_ptr, gr_ptr, gm.data_ptr<float>(), gc.data_ptr<float>(),
+         n,t,chunks,nb,ci,(float)floor);
+     C10_CUDA_KERNEL_LAUNCH_CHECK();
+   }
+   if constexpr (NEED_DYNAMICS) {
+     if constexpr (NEED_INITIAL) {
+       gm0.copy_(gm); gc0.copy_(gc);
+       return {gk,gv,gq,gd,gp,gr,gm0,gc0};
+     }
+     return {gk,gv,gq,gd,gp,gr};
+   }
+   return {gk,gv,gq};
+ }
  auto mp=torch::empty({n,chunks,2,8},keys.options()),pp=torch::empty({n,chunks,2,2},keys.options());
  auto uh=torch::empty({n,chunks,2},keys.options()),bh=torch::empty({n,chunks},keys.options());
  auto eh=torch::empty({n,chunks,8},keys.options());
