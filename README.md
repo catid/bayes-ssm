@@ -136,9 +136,9 @@ paper mechanisms but has lower state capacity than the default D=8 row.
 
 | Model | Parameters | State | Throughput | Peak allocated VRAM | Validation loss |
 |---|---:|---|---:|---:|---:|
-| Mamba-3 TE FP8 matched hybrid | 101.916M | Mamba-3 SISO + GQA | **385,083 tok/s** | 63,415 MiB | 10.3737 |
-| Bayesian TE FP8, all optimizations | 101.828M | D=1, M=8; scalar covariance/head | **391,105 tok/s** | 62,801 MiB | 10.3883 |
-| Bayesian TE FP8, two-head grouped kernel | 101.928M | D=2, M=8; dense 2×2 covariance/head | **368,171 tok/s** | 61,994 MiB | 10.3826 |
+| Mamba-3 TE FP8 matched hybrid | 101.916M | Mamba-3 SISO + GQA | **384,380 tok/s** | 63,415 MiB | 10.3738 |
+| Bayesian TE FP8, all optimizations | 101.828M | D=1, M=8; scalar covariance/head | **391,628 tok/s** | 62,801 MiB | 10.3894 |
+| Bayesian TE FP8, two-head grouped kernel | 101.928M | D=2, M=8; dense 2×2 covariance/head | **368,270 tok/s** | 61,994 MiB | 10.3828 |
 | Bayesian TE FP8, optimized D=4 | 99.918M | D=4, M=8; dense 4×4 covariance/head | 323,185 tok/s | 62,492 MiB | 10.4752 |
 | Bayesian TE FP8, optimized D=8 | 101.500M | D=8, M=8; dense 8×8 covariance/head | 298,740 tok/s | 63,480 MiB | 10.4705 |
 
@@ -146,7 +146,7 @@ The latest D=1 path uses saved replay history and a register-only backward kerne
 that processes two heads per CUDA block.  This keeps the full paper feature set and
 cuts the direct D=1 backward kernel from 1.156 ms to 0.644 ms at `N=8192, T=512`.
 At the parameter-matched `MLP=8736` Bayesian / `MLP=8400` Mamba-3 shape, a
-120-step run reached 391,105 versus 385,083 tok/s.  The Bayesian row has
+120-step run reached 391,628 versus 384,380 tok/s.  The Bayesian row has
 101.828M parameters versus 101.916M for Mamba-3 (0.087% fewer), with the same
 width, sequence length, batch, precision, graph, and optimizer settings.  The
 hardware-tuned `MLP=8576` result is 388,448 tok/s at 100.353M parameters. The
@@ -193,8 +193,15 @@ is 0.644 ms versus 1.156 ms for one head per block, with ≤`4.8e-6` gradient
 error across tested partial and full blocks.
 The D=2 forward/recompute/backward path now groups two heads per block as well;
 its direct dynamic forward-plus-backward time fell from 5.08 ms to 3.44 ms at
-`N=8192, T=512`, and the six-layer run reached 368,171 tok/s with ≤`3.8e-6`
+`N=8192, T=512`, and the six-layer run reached 368,270 tok/s with ≤`3.8e-6`
 gradient error.
+
+The readout-only language-model path also uses a lean exact reverse kernel:
+unused final mean/covariance gradients remain `None` instead of being
+materialized as zero tensors, so the reverse pass skips state and dynamics
+gradient work the model cannot consume. Commit `3ebc516` preserves the full
+reverse path whenever a caller requests either returned state. The fresh
+120-step D=1 and Mamba-3 measurements above use this path.
 
 The D8 kernel has also received exact SM103 optimizations: the forward
 covariance prediction and mean innovation reuse `d * k`, covariance adjoints
