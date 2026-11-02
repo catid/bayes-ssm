@@ -201,7 +201,7 @@ std::vector<torch::Tensor> persistent_bayes_saved(
 
 namespace {
 
-template<int D,int M,int THREADS,bool FIXED=false>
+template<int D,int M,int THREADS,bool FIXED=false,int GROUPS=1>
 __global__ void chunk_forward_kernel(
  const float* __restrict__ keys,const float* __restrict__ values,const float* __restrict__ queries,
  const float* __restrict__ decay,const float* __restrict__ process,const float* __restrict__ observation,
@@ -210,8 +210,12 @@ __global__ void chunk_forward_kernel(
  float* __restrict__ mp_hist,float* __restrict__ pp_hist,float* __restrict__ uh_hist,
  float* __restrict__ bh_hist,float* __restrict__ eh_hist,
  int n,int t,int chunks,int nb,float floor) {
- int b=blockIdx.x,tid=threadIdx.x;if(b>=n)return; extern __shared__ float sm[];
- float* mean=sm;float* cov=mean+D*M;float* cp=cov+D*D;
+ int tid0=threadIdx.x; int group=tid0/THREADS;
+ int b=blockIdx.x*GROUPS+group,tid=tid0%THREADS;if(b>=n)return;
+ extern __shared__ float sm[];
+ constexpr int PER=D*M+2*D*D+D+M+1;
+ float* sm_base=sm+group*PER;
+ float* mean=sm_base;float* cov=mean+D*M;float* cp=cov+D*D;
  float* u=FIXED ? cov+D*D : cp+D*D;float* err=u+D;float* si=err+M;
  for(int x=tid;x<D*M;x+=THREADS) mean[x]=mean0[b*D*M+x];
  for(int x=tid;x<D*D;x+=THREADS) cov[x]=cov0[b*D*D+x]; narrow_sync<THREADS>();
@@ -391,10 +395,11 @@ std::vector<torch::Tensor> forward_chunked_saved(
  auto bm=torch::empty({n,nb+1,1,8},keys.options()),bc=torch::empty({n,nb+1,1,1},keys.options());
  auto mp=torch::empty({n,t,1,8},keys.options()),pp=torch::empty({n,t,1,1},keys.options());
  auto uh=torch::empty({n,t,1},keys.options()),bh=torch::empty({n,t},keys.options()),eh=torch::empty({n,t,8},keys.options());
- constexpr int th=8; constexpr size_t sh=(8+1+1+1+8+1)*sizeof(float);
- cudaFuncSetAttribute(chunk_forward_kernel<1,8,th>,cudaFuncAttributeMaxDynamicSharedMemorySize,(int)sh);
+ constexpr int th=8; constexpr int groups=2;
+ constexpr size_t sh=groups*(8+1+1+1+8+1)*sizeof(float);
+ cudaFuncSetAttribute(chunk_forward_kernel<1,8,th,false,groups>,cudaFuncAttributeMaxDynamicSharedMemorySize,(int)sh);
  auto st=at::cuda::getCurrentCUDAStream();
- chunk_forward_kernel<1,8,th><<<n,th,sh,st>>>(
+ chunk_forward_kernel<1,8,th,false,groups><<<(n+groups-1)/groups,groups*th,sh,st>>>(
    keys.data_ptr<float>(),values.data_ptr<float>(),queries.data_ptr<float>(),decay.data_ptr<float>(),
    process.data_ptr<float>(),observation.data_ptr<float>(),mean0.data_ptr<float>(),cov0.data_ptr<float>(),
    out.data_ptr<float>(),mf.data_ptr<float>(),cf.data_ptr<float>(),bm.data_ptr<float>(),bc.data_ptr<float>(),
