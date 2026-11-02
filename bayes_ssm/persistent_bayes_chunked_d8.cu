@@ -254,24 +254,39 @@ __global__ void recompute_chunk_kernel(
  const float* __restrict__ keys,const float* __restrict__ values,const float* __restrict__ decay,const float* __restrict__ process,const float* __restrict__ observation,
  const float* __restrict__ bmean,const float* __restrict__ bcov,float* __restrict__ mp,float* __restrict__ pp,float* __restrict__ uh,float* __restrict__ bh,float* __restrict__ eh,
  int n,int t,int chunks,int nb,int ci,float floor) {
- int b=blockIdx.x,tid=threadIdx.x;if(b>=n)return;extern __shared__ float sm[];float* mean=sm;float* cov=mean+D*M;float* cp=cov+D*D;float* u=FIXED ? cov+D*D : cp+D*D;float* err=u+D;float* si=err+M;
+ int b=blockIdx.x,tid=threadIdx.x;if(b>=n)return;extern __shared__ float sm[];float* mean=sm;float* cov=mean+D*M;
+ // The replay kernel needs P_pred only as a saved global boundary history.
+ // Write that history directly and avoid allocating a shared ``cp`` tile;
+ // the reverse pass consumes pp, while the forward update can reconstruct
+ // each covariance entry from the old cov and diagonal dynamics.
+ float* u=cov+D*D;float* err=u+D;float* si=err+M;
  size_t bo=(size_t)b*(nb+1);for(int x=tid;x<D*M;x+=THREADS)mean[x]=bmean[bo*D*M+(size_t)ci*D*M+x];for(int x=tid;x<D*D;x+=THREADS)cov[x]=bcov[bo*D*D+(size_t)ci*D*D+x];__syncthreads();
  int start=ci*chunks,len=min(chunks,t-start);for(int li=0;li<len;++li){int ti=start+li;size_t hb=(size_t)b*(size_t)chunks+(size_t)li;const float*k=keys+((size_t)b*t+ti)*D;const float*v=values+((size_t)b*t+ti)*M;const float*d=decay+((size_t)b*t+ti)*D;float pv=FIXED?0.1f:process[(size_t)b*t+ti],rv=FIXED?1.0f:observation[(size_t)b*t+ti];
    if constexpr (!FIXED) {
-     for(int x=tid;x<D*D;x+=THREADS){int i=x/D,j=x%D;if(i<=j){float value=cov[i*D+j]*d[i]*d[j]+(i==j?pv:0.f);cp[i*D+j]=value;cp[j*D+i]=value;}}
+     for(int x=tid;x<D*D;x+=THREADS){
+       int i=x/D,j=x%D;
+       pp[hb*D*D+x] = cov[i*D+j]*d[i]*d[j] + (i==j?pv:0.f);
+     }
    }
    __syncthreads();
    if constexpr (FIXED) {
      for(int i=tid;i<D;i+=THREADS){float z=0;for(int j=0;j<D;++j)z+=cov[i*D+j]*k[j];u[i]=0.9409f*z+0.1f*k[i];}
    } else {
-     for(int i=tid;i<D;i+=THREADS){float z=0;for(int j=0;j<D;++j)z+=cp[i*D+j]*k[j];u[i]=z;}
+     for(int i=tid;i<D;i+=THREADS){
+       float z=0.0f;
+       for(int j=0;j<D;++j) z += cov[i*D+j]*d[j]*k[j];
+       u[i]=d[i]*z + pv*k[i];
+     }
    }
    __syncthreads();if(tid==0){float z=rv;for(int i=0;i<D;++i)z+=k[i]*u[i];si[0]=fmaxf(z,floor);}for(int c=tid;c<M;c+=THREADS){float z=0;for(int i=0;i<D;++i)z+=(FIXED?0.97f:d[i])*mean[i*M+c]*k[i];err[c]=v[c]-z;}__syncthreads();float beta=1.f/si[0];
    for(int x=tid;x<D*M;x+=THREADS){int i=x/M,c=x%M;mp[hb*D*M+x]=(FIXED?0.97f:d[i])*mean[x];}
    if constexpr (FIXED) {
      for(int x=tid;x<D*D;x+=THREADS){int i=x/D,j=x%D;pp[hb*D*D+x]=0.9409f*cov[x]+(i==j?0.1f:0.f);}
    } else {
-     for(int x=tid;x<D*D;x+=THREADS)pp[hb*D*D+x]=cp[x];
+     // pp was written before the u reduction above, while cov still held
+     // the previous state.  No local covariance prediction is needed.
+     // (The branch is intentionally empty; retaining it documents that the
+     // history has already been materialized.)
    }
    for(int i=tid;i<D;i+=THREADS)uh[hb*D+i]=u[i];for(int c=tid;c<M;c+=THREADS)eh[hb*M+c]=err[c];if(tid==0)bh[hb]=beta;
    for(int x=tid;x<D*M;x+=THREADS){int i=x/M,c=x%M;mean[x]=(FIXED?0.97f:d[i])*mean[x]+beta*u[i]*err[c];}__syncthreads();
@@ -286,7 +301,14 @@ __global__ void recompute_chunk_kernel(
        }
      }
    } else {
-     for(int x=tid;x<D*D;x+=THREADS){int i=x/D,j=x%D;if(i<=j){float value=cp[i*D+j]-beta*u[i]*u[j];cov[i*D+j]=value;cov[j*D+i]=value;}}
+     for(int x=tid;x<D*D;x+=THREADS){
+       int i=x/D,j=x%D;
+       if(i<=j){
+         float value=cov[i*D+j]*d[i]*d[j] + (i==j?pv:0.f)
+                    - beta*u[i]*u[j];
+         cov[i*D+j]=value; cov[j*D+i]=value;
+       }
+     }
    }
    __syncthreads();
  }
@@ -338,6 +360,111 @@ __global__ void backward_chunk_kernel(
  }
  for(int x=tid;x<D*M;x+=THREADS)gm_state[b*D*M+x]=gM[x];for(int x=tid;x<D*D;x+=THREADS)gc_state[b*D*D+x]=gC[x];
 }
+
+// Fused recompute + reverse kernel.  The regular path launches a recompute
+// kernel and then a backward kernel for every chunk, materializing five
+// history tensors in global memory between the launches.  For D=M=8 those
+// histories fit comfortably in shared memory at the production chunk size
+// (64), so keep them on chip and run the reverse pass immediately.  This
+// removes the global history traffic and one launch per chunk while retaining
+// the exact dense-covariance recurrence and all dynamic gradients.
+template<int D,int M,int THREADS,bool NEED_DYNAMICS>
+__global__ void fused_backward_chunk_kernel(
+ const float* __restrict__ keys,const float* __restrict__ values,const float* __restrict__ queries,
+ const float* __restrict__ decay,const float* __restrict__ process,const float* __restrict__ observation,
+ const float* __restrict__ bmean,const float* __restrict__ bcov,
+ const float* __restrict__ gy,
+ float* __restrict__ gkeys,float* __restrict__ gvalues,float* __restrict__ gqueries,
+ float* __restrict__ gdecay,float* __restrict__ gprocess,float* __restrict__ gobservation,
+ float* __restrict__ gm_state,float* __restrict__ gc_state,
+ int n,int t,int chunks,int nb,int ci,float floor) {
+  const int b=blockIdx.x, tid=threadIdx.x;
+  if (b>=n) return;
+  extern __shared__ float sm[];
+  // State and temporary vectors/matrices.
+  float* mean=sm; float* cov=mean+D*M; float* cp=cov+D*D;
+  float* u=cp+D*D; float* err=u+D; float* gM=err+M;
+  float* gC=gM+D*M; float* gMprev=gC+D*D; float* gCprev=gMprev+D*M;
+  float* ge=gCprev+D*D; float* gu=ge+M; float* gk=gu+D;
+  float* red=gk+D;
+  // Histories are laid out with a runtime stride of `chunks`; only the first
+  // len entries are used by the final (short) chunk.
+  float* hmp=red+THREADS;
+  float* hpp=hmp+(size_t)chunks*D*M;
+  float* huh=hpp+(size_t)chunks*D*D;
+  float* hbh=huh+(size_t)chunks*D;
+  float* heh=hbh+chunks;
+  __shared__ float scalars[3];
+  const int start=ci*chunks, len=min(chunks,t-start);
+  const size_t bo=((size_t)b*(nb+1)+ci);
+  for(int x=tid;x<D*M;x+=THREADS){mean[x]=bmean[bo*D*M+x];gM[x]=gm_state[(size_t)b*D*M+x];}
+  for(int x=tid;x<D*D;x+=THREADS){cov[x]=bcov[bo*D*D+x];gC[x]=gc_state[(size_t)b*D*D+x];}
+  __syncthreads();
+  // Forward replay into shared histories.
+  for(int li=0;li<len;++li){
+    const int ti=start+li;
+    const float* k=keys+((size_t)b*t+ti)*D;
+    const float* v=values+((size_t)b*t+ti)*M;
+    const float* d=decay+((size_t)b*t+ti)*D;
+    float pv=process[(size_t)b*t+ti], rv=observation[(size_t)b*t+ti];
+    for(int x=tid;x<D*D;x+=THREADS){int i=x/D,j=x%D;if(i<=j){float z=cov[i*D+j]*d[i]*d[j]+(i==j?pv:0.f);cp[i*D+j]=z;cp[j*D+i]=z;}}
+    __syncthreads();
+    for(int i=tid;i<D;i+=THREADS){float z=0.f;for(int j=0;j<D;++j)z+=cp[i*D+j]*k[j];u[i]=z;}
+    __syncthreads();
+    if(tid==0){float z=rv;for(int i=0;i<D;++i)z+=k[i]*u[i];scalars[0]=fmaxf(z,floor);hbh[li]=1.f/scalars[0];}
+    for(int c=tid;c<M;c+=THREADS){float z=0.f;for(int i=0;i<D;++i)z+=d[i]*mean[i*M+c]*k[i];err[c]=v[c]-z;}
+    __syncthreads();
+    const float beta=hbh[li];
+    for(int x=tid;x<D*M;x+=THREADS){int i=x/M;hmp[(size_t)li*D*M+x]=d[i]*mean[x];heh[(size_t)li*M+(x%M)]=err[x%M];}
+    for(int x=tid;x<D*D;x+=THREADS)hpp[(size_t)li*D*D+x]=cp[x];
+    for(int i=tid;i<D;i+=THREADS)huh[(size_t)li*D+i]=u[i];
+    for(int x=tid;x<D*M;x+=THREADS){int i=x/M,c=x%M;mean[x]=d[i]*mean[x]+beta*u[i]*err[c];}
+    __syncthreads();
+    for(int x=tid;x<D*D;x+=THREADS){int i=x/D,j=x%D;if(i<=j){float z=cp[i*D+j]-beta*u[i]*u[j];cov[i*D+j]=z;cov[j*D+i]=z;}}
+    __syncthreads();
+  }
+  // Reverse replay.  This is algebraically identical to backward_chunk_kernel
+  // but reads the histories above instead of global temporary tensors.
+  for(int li=len-1;li>=0;--li){
+    const int ti=start+li;
+    const float* k=keys+((size_t)b*t+ti)*D;
+    const float* q=queries+((size_t)b*t+ti)*D;
+    const float* d=decay+((size_t)b*t+ti)*D;
+    const float* mp0=hmp+(size_t)li*D*M; const float* pp0=hpp+(size_t)li*D*D;
+    const float* uh=huh+(size_t)li*D; const float* e=heh+(size_t)li*M; const float beta=hbh[li];
+    const float* gyt=gy+((size_t)b*t+ti)*M; const float rv=observation[(size_t)b*t+ti];
+    for(int i=tid;i<D;i+=THREADS){float z=0;for(int c=0;c<M;++c)z+=(mp0[i*M+c]+beta*uh[i]*e[c])*gyt[c];gqueries[((size_t)b*t+ti)*D+i]=z;}
+    for(int x=tid;x<D*M;x+=THREADS){int i=x/M,c=x%M;gM[x]+=q[i]*gyt[c];}
+    __syncthreads();
+    for(int c=tid;c<M;c+=THREADS){float z=0;for(int i=0;i<D;++i)z+=gM[i*M+c]*uh[i];ge[c]=beta*z;gvalues[((size_t)b*t+ti)*M+c]=ge[c];}
+    __syncthreads();
+    for(int x=tid;x<D*M;x+=THREADS){int i=x/M,c=x%M;gMprev[x]=gM[x]-k[i]*ge[c];}
+    for(int i=tid;i<D;i+=THREADS){float z=0;for(int c=0;c<M;++c)z+=mp0[i*M+c]*ge[c];gk[i]=-z;}
+    __syncthreads();
+    float z=0;for(int x=tid;x<D*D;x+=THREADS){int i=x/D,j=x%D;float r=.5f*(gC[x]+gC[j*D+i]);z-=r*uh[i]*uh[j];}for(int x=tid;x<D*M;x+=THREADS){int i=x/M,c=x%M;z+=gM[x]*uh[i]*e[c];}red[tid]=z;__syncthreads();
+    for(int off=THREADS/2;off>0;off>>=1){if(tid<off)red[tid]+=red[tid+off];__syncthreads();}
+    if(tid==0){float s=rv;for(int i=0;i<D;++i)s+=k[i]*uh[i];scalars[0]=red[0];scalars[1]=(s>floor)?-red[0]*beta*beta:0.f;if constexpr(NEED_DYNAMICS)gobservation[(size_t)b*t+ti]=scalars[1];}
+    __syncthreads(); const float gs=scalars[1];
+    for(int i=tid;i<D;i+=THREADS){float a=0,bv=0;for(int c=0;c<M;++c)a+=gM[i*M+c]*e[c];for(int j=0;j<D;++j){float r=.5f*(gC[i*D+j]+gC[j*D+i]);bv+=2.f*r*uh[j];}gu[i]=beta*(a-bv)+gs*k[i];gk[i]+=gs*uh[i];}
+    __syncthreads();
+    for(int i=tid;i<D;i+=THREADS){float zz=0;for(int j=0;j<D;++j)zz+=pp0[j*D+i]*gu[j];gk[i]+=zz;}
+    for(int x=tid;x<D*D;x+=THREADS){int i=x/D,j=x%D;float r=.5f*(gC[x]+gC[j*D+i]);float gu_sym=.5f*(gu[i]*k[j]+gu[j]*k[i]);gCprev[x]=(r+gu_sym)*d[i]*d[j];}
+    __syncthreads();
+    const float* mean_prev; const float* cov_prev; const float* mp_prev=nullptr; const float* pp_prev=nullptr; const float* uh_prev=nullptr; const float* eh_prev=nullptr; float beta_prev=0;
+    if(li==0){mean_prev=bmean+((size_t)b*(nb+1)+ci)*D*M;cov_prev=bcov+((size_t)b*(nb+1)+ci)*D*D;}else{mp_prev=hmp+(size_t)(li-1)*D*M;pp_prev=hpp+(size_t)(li-1)*D*D;uh_prev=huh+(size_t)(li-1)*D;eh_prev=heh+(size_t)(li-1)*M;beta_prev=hbh[li-1];}
+    __syncthreads();
+    if constexpr(NEED_DYNAMICS){
+      for(int i=tid;i<D;i+=THREADS){float zd=0,zm=0;for(int j=0;j<D;++j){float cpv;if(li==0)cpv=cov_prev[i*D+j];else{float zc=pp_prev[i*D+j]-beta_prev*uh_prev[i]*uh_prev[j];cpv=.5f*(zc+(pp_prev[j*D+i]-beta_prev*uh_prev[j]*uh_prev[i]));}float gij=gCprev[i*D+j]/(d[i]*d[j]),gji=gCprev[j*D+i]/(d[j]*d[i]);zd+=gij*cpv*d[j]+gji*cpv*d[j];}for(int c=0;c<M;++c){float mv;if(li==0)mv=mean_prev[i*M+c];else mv=mp_prev[i*M+c]+beta_prev*uh_prev[i]*eh_prev[c];zm+=gMprev[i*M+c]*mv;}gdecay[((size_t)b*t+ti)*D+i]=zd+zm;}
+      float pz=0;for(int i=tid;i<D;i+=THREADS)pz+=gCprev[i*D+i]/(d[i]*d[i]);red[tid]=pz;__syncthreads();for(int off=THREADS/2;off>0;off>>=1){if(tid<off)red[tid]+=red[tid+off];__syncthreads();}if(tid==0)gprocess[(size_t)b*t+ti]=red[0];
+    }
+    for(int x=tid;x<D*M;x+=THREADS){int i=x/M;gM[x]=gMprev[x]*d[i];}
+    for(int x=tid;x<D*D;x+=THREADS)gC[x]=gCprev[x];
+    for(int i=tid;i<D;i+=THREADS)gkeys[((size_t)b*t+ti)*D+i]=gk[i];
+    __syncthreads();
+  }
+  for(int x=tid;x<D*M;x+=THREADS)gm_state[(size_t)b*D*M+x]=gM[x];
+  for(int x=tid;x<D*D;x+=THREADS)gc_state[(size_t)b*D*D+x]=gC[x];
+ }
 }
 
 std::vector<torch::Tensor> forward_chunked(
@@ -369,6 +496,30 @@ std::vector<torch::Tensor> backward_chunked_impl(
  }
  auto gm=torch::empty_like(mean0),gc=torch::empty_like(cov0);
  gm.copy_(gmf); gc.copy_(gcf);
+ // The fused replay path keeps each chunk's forward history in shared
+ // memory.  At the production chunk length (64) this is ~39 KiB per block,
+ // avoiding the global history tensors and the separate recompute launch.
+ // Keep the existing path for unusually large chunks so dynamic shared
+ // memory usage remains within the device limit.
+ if (chunks <= 128) {
+   constexpr int fth = 64;
+   const size_t base_floats = 3*8*8 + 2*8*8 + 2*8 + 8 + 2*8*8 + 8*8 + 8 + 2*8 + fth;
+   const size_t hist_floats = (size_t)chunks * (2*8*8 + 8*8 + 8 + 8 + 1);
+   const size_t shared_bytes = (base_floats + hist_floats) * sizeof(float);
+   cudaFuncSetAttribute(fused_backward_chunk_kernel<8,8,fth,NEED_DYNAMICS>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)shared_bytes);
+   auto st = at::cuda::getCurrentCUDAStream();
+   float *gd_ptr=nullptr,*gp_ptr=nullptr,*gr_ptr=nullptr;
+   if constexpr (NEED_DYNAMICS) { gd_ptr=gd.data_ptr<float>(); gp_ptr=gp.data_ptr<float>(); gr_ptr=gr.data_ptr<float>(); }
+   for (int ci=nb-1; ci>=0; --ci) {
+     fused_backward_chunk_kernel<8,8,fth,NEED_DYNAMICS><<<n,fth,shared_bytes,st>>>(
+       keys.data_ptr<float>(),values.data_ptr<float>(),queries.data_ptr<float>(),decay.data_ptr<float>(),process.data_ptr<float>(),observation.data_ptr<float>(),
+       bm.data_ptr<float>(),bc.data_ptr<float>(),gy.data_ptr<float>(),gk.data_ptr<float>(),gv.data_ptr<float>(),gq.data_ptr<float>(),gd_ptr,gp_ptr,gr_ptr,
+       gm.data_ptr<float>(),gc.data_ptr<float>(),n,t,chunks,nb,ci,(float)floor);
+     C10_CUDA_KERNEL_LAUNCH_CHECK();
+   }
+   if constexpr (NEED_DYNAMICS) { gm0.copy_(gm); gc0.copy_(gc); return {gk,gv,gq,gd,gp,gr,gm0,gc0}; }
+   return {gk,gv,gq};
+ }
  auto mp=torch::empty({n,chunks,8,8},keys.options()),pp=torch::empty_like(mp);
  auto uh=torch::empty({n,chunks,8},keys.options()),bh=torch::empty({n,chunks},keys.options());
  auto eh=torch::empty({n,chunks,8},keys.options());
@@ -378,11 +529,14 @@ std::vector<torch::Tensor> backward_chunked_impl(
  }
  constexpr int th=FIXED ? 256 : 64;
  size_t sh=(FIXED ? 3*8*8+3*8+th : 4*8*8+3*8+th)*sizeof(float);
- cudaFuncSetAttribute(recompute_chunk_kernel<8,8,th,FIXED>,cudaFuncAttributeMaxDynamicSharedMemorySize,(int)((FIXED ? 2*8*8+3*8 : 3*8*8+3*8)*sizeof(float)));
+ // Dynamic replay no longer allocates a shared covariance-prediction tile;
+ // pp is written directly to global history before the matvec.  The fixed
+ // specialization has always used the smaller 2*D*D footprint as well.
+ cudaFuncSetAttribute(recompute_chunk_kernel<8,8,th,FIXED>,cudaFuncAttributeMaxDynamicSharedMemorySize,(int)(2*8*8+3*8)*sizeof(float));
  cudaFuncSetAttribute(backward_chunk_kernel<8,8,th,NEED_DYNAMICS,FIXED>,cudaFuncAttributeMaxDynamicSharedMemorySize,(int)sh);
  auto st=at::cuda::getCurrentCUDAStream();
  for(int ci=nb-1;ci>=0;--ci){
-   recompute_chunk_kernel<8,8,th,FIXED><<<n,th,(FIXED ? 2*8*8+3*8 : 3*8*8+3*8)*sizeof(float),st>>>(
+   recompute_chunk_kernel<8,8,th,FIXED><<<n,th,(2*8*8+3*8)*sizeof(float),st>>>(
      keys.data_ptr<float>(),values.data_ptr<float>(),decay.data_ptr<float>(),process.data_ptr<float>(),observation.data_ptr<float>(),
      bm.data_ptr<float>(),bc.data_ptr<float>(),mp.data_ptr<float>(),pp.data_ptr<float>(),uh.data_ptr<float>(),bh.data_ptr<float>(),eh.data_ptr<float>(),n,t,chunks,nb,ci,(float)floor);
    backward_chunk_kernel<8,8,th,NEED_DYNAMICS,FIXED><<<n,th,sh,st>>>(
