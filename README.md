@@ -70,6 +70,43 @@ fixed-dynamics approximation. The Mamba validation used a 64-example per-GPU
 validation batch to avoid post-run memory pressure; validation is not part of
 the timed training measurement.
 
+### Mixed-width exact CUDA path
+
+The full paper equations do not require the key/state width to equal the value
+width. `--bayes-key-dim 4` keeps 8-wide values and dense 4×4 covariance per
+head, while retaining causal Q/K/V convolutions, input-dependent decay,
+process noise, observation noise, FP32 state, and exact replay backward. The
+fused CUDA loader has dedicated D=4/M=8 and D=8/M=8 kernels. Use it with:
+
+```bash
+python example/train_6layer.py --device cuda:0 --precision bf16 \
+  --fused-rmsnorm --compile-components both --optimize-bayes \
+  --bayes-backend fused --bayes-key-dim 4 --cuda-graph --gpu-batch-staging \
+  --width 512 --heads 64 --kv-heads 4 --mlp-width 8619 \
+  --seq 512 --batch 128 --steps 40 --warmup 5
+```
+
+This is a single-GB300 measurement of the complete forward, backward, gradient
+clip, and AdamW step. The Mamba-3 row uses the same batch and graph settings,
+with the parameter-matched 8,403-wide MLP:
+
+| Model | Parameters | Bayesian state | Batch × sequence | Throughput | Peak allocated VRAM | Validation loss |
+|---|---:|---:|---:|---:|---:|---:|
+| Bayesian fused | 101.936M | D=4, M=8 | 128 × 512 | **434,185 tok/s** | 60,197 MiB | 10.4264 |
+| Bayesian fused | 101.942M | D=8, M=8 | 128 × 512 | 394,081 tok/s | 62,427 MiB | — |
+| Mamba-3 matched hybrid | 101.944M | — | 128 × 512 | **660,341 tok/s** | 60,093 MiB | 10.4612 |
+
+The mixed-width kernel is 10.2% faster and uses 3.6% less allocated memory than
+the D=8 Bayesian path, and its recurrence-only benchmark is 29.6% faster. It
+does not yet beat Mamba-3 end to end: at this matched single-GPU shape it is
+1.52× slower. Dense covariance has quadratic state cost, so preserving the
+paper's full covariance and input-dependent dynamics imposes a real lower
+bound; claiming a Mamba-3 speedup would require either a faster kernel for the
+remaining projections/FFNs or a smaller state width. The raw records are
+[Bayesian D4/M8](example/results/gb300_6layer_bayes_paper_d4m8_fused_single.json),
+[Bayesian D8/M8](example/results/gb300_6layer_bayes_paper_d8_fused.json), and
+[Mamba-3](example/results/gb300_6layer_mamba3_paper_match_single_b128.json).
+
 Use `--bayes-backend fused` when the lower-memory custom CUDA replay path is preferred. The recorded paper-feature result uses the Inductor backend with learned input-dependent dynamics; backend rankings can change with sequence length and batch shape.
 
 The paper's damped rotational variant is available with
