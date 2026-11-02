@@ -13,7 +13,8 @@ namespace {
 template <int THREADS>
 __device__ __forceinline__ void narrow_sync() {
   if constexpr (THREADS <= 32) {
-    __syncwarp((1u << THREADS) - 1u);
+    constexpr unsigned mask = THREADS == 32 ? 0xffffffffu : ((1u << THREADS) - 1u);
+    __syncwarp(mask);
   } else {
     __syncthreads();
   }
