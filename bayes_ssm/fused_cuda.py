@@ -164,6 +164,9 @@ class _ChunkedBayesianFunction(torch.autograd.Function):
         ctx.need_initial_grad = (
             initial_mean.requires_grad or initial_covariance.requires_grad
         )
+        # Every backward branch consults this marker; initialize it for the
+        # regular/full ABI as well as the optional no-initial fast ABI.
+        ctx.noinitial_backward = False
         ctx.output_shape = tuple(output.shape)
         ctx.mean_shape = tuple(final_mean.shape)
         ctx.covariance_shape = tuple(final_covariance.shape)
