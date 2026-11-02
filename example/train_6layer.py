@@ -940,6 +940,11 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     # run pays the one-time Dynamo/Inductor compilation cost.
     if args.compile_components != "none":
         compile_mode = os.environ.get("BAYES_SSM_COMPILE_MODE", "default")
+        if compile_mode != "default" and args.cuda_graph:
+            raise ValueError(
+                "BAYES_SSM_COMPILE_MODE other than 'default' is incompatible "
+                "with --cuda-graph; unset it or disable CUDA graphs"
+            )
         for block in model.blocks:
             if args.compile_components in ("gqa", "both", "all") and isinstance(block.mixer, GQAAttention):
                 block.mixer = torch.compile(
