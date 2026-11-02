@@ -269,7 +269,7 @@ was bitwise identical in the direct comparison).
 
 The production CUDA reverse kernels preserve the row-wise `u kᵀ` contribution
 through the transition scaling; mirroring it would silently remove valid
- derivatives.  Their validated contract is the readout-only training boundary,
+derivatives.  Their validated contract is the readout-only training boundary,
 where the initial mean and covariance are constants and learned transition,
 process-noise, and observation-noise gradients remain enabled. If a caller
 requests gradients through an initial mean or covariance, the public API uses
