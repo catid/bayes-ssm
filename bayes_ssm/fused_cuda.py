@@ -241,7 +241,11 @@ class _ChunkedBayesianFunction(torch.autograd.Function):
                 ctx.chunk_length, ctx.denominator_floor,
             )
             if lean_backward:
-                return (*gradients, None, None, None, None, None, None, None, None)
+                # The forward has eight tensor inputs followed by three
+                # scalar metadata arguments.  Lean mode returns gradients
+                # only for keys/values/queries; the other five tensor inputs
+                # and three metadata values still need exactly eight slots.
+                return (*gradients, None, None, None, None, None, None, None)
             return (*gradients, None, None, None)
         if lean_backward:
             gradients = backward(
@@ -249,8 +253,9 @@ class _ChunkedBayesianFunction(torch.autograd.Function):
                 initial_mean, initial_covariance, boundary_mean, boundary_covariance,
                 grad_output, ctx.chunk_length, ctx.denominator_floor,
             )
-            # 3 tensor gradients + 8 non-differentiable inputs.
-            return (*gradients, None, None, None, None, None, None, None, None)
+            # Three tensor gradients plus five tensor and three scalar
+            # non-differentiable inputs = eleven backward slots.
+            return (*gradients, None, None, None, None, None, None, None)
         gradients = backward(
             keys, values, queries, decay, process, observation,
             initial_mean, initial_covariance, boundary_mean, boundary_covariance,
