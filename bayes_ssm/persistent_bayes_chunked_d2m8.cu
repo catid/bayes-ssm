@@ -311,7 +311,9 @@ __global__ void backward_chunk_kernel(
    if constexpr (!FIXED) {
      for(int x=tid;x<D*M;x+=THREADS){int i=x/M,c=x%M;gMprev[x]=gM[x]-k[i]*ge[c];}
    }
-   for(int i=tid;i<D;i+=THREADS){float z=0;for(int c=0;c<M;++c)z+=mp0[i*M+c]*ge[c];gk[i]=-z;}sync_threads_d2<THREADS>(0xffffu << (group*16));
+   // gk is independent of the scalar covariance reduction and is consumed
+   // only when the token's final gradient is stored; skip this barrier.
+   for(int i=tid;i<D;i+=THREADS){float z=0;for(int c=0;c<M;++c)z+=mp0[i*M+c]*ge[c];gk[i]=-z;}
    float z=0;for(int x=tid;x<D*D;x+=THREADS){int i=x/D,j=x%D;if(i<=j){float r=.5f*(gC[x]+gC[j*D+i]);z-=r*u[i]*u[j]*(i==j?1.f:2.f);}}for(int x=tid;x<D*M;x+=THREADS){int i=x/M,c=x%M;z+=gM[x]*u[i]*e[c];}z=warp_sum_d2(z, 0xffffu << (group*16));
    if(tid==0){float s=rv;for(int i=0;i<D;++i)s+=k[i]*u[i];scalars[group][0]=z;scalars[group][1]=(s>floor)?-z*beta*beta:0.f;
      if constexpr (NEED_DYNAMICS && !FIXED) gobservation[(size_t)b*t+ti]=scalars[group][1];
