@@ -123,7 +123,7 @@ Q/K/V convolutions, dense covariance, and FP32 recurrent state). It uses the
 explicit TE FP8 optimizations `--fuse-bayes-gate`,
 `--fuse-te-aux-projection`, `--bf16-state-projection`, and
 `--fuse-bayes-norm-linear`; the last two flags only
-changes SiLU and per-head normalization before the inputs are cast to the
+change SiLU and per-head normalization before the inputs are cast to the
 unchanged FP32 recurrence. A whole-sequence replay chunk removes unnecessary
 chunk launch overhead at this fixed 512-token shape.
 
